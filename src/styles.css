@@ -328,6 +328,21 @@ html, body {
   font-size: clamp(64px, 12vw, 280px);
   font-weight: 500;
   letter-spacing: 0.01em;
+  text-shadow:
+    0 0 60px rgba(255, 255, 255, 0.06),
+    0 0 120px rgba(255, 255, 255, 0.03);
+}
+
+.money-digit {
+  display: inline-block;
+  transition: transform 0.15s cubic-bezier(0.2, 0, 0.2, 1),
+              opacity 0.15s ease;
+  will-change: transform;
+}
+
+.money-sep {
+  display: inline-block;
+  opacity: 0.35;
 }
 
 .money-cents {
@@ -336,6 +351,7 @@ html, body {
   vertical-align: super;
   margin-left: 0.02em;
   font-weight: 300;
+  transition: opacity 0.3s ease;
 }
 
 /* ── Weekly Section ── */
@@ -374,84 +390,127 @@ html, body {
 .weekly-pct.warning { color: #fbbf24; }
 .weekly-pct.danger { color: #f87171; }
 
-/* ── Controls ── */
-.controls {
+/* ── Controls Bar ── */
+.controls-bar {
   position: fixed;
   bottom: clamp(16px, 3vh, 40px);
   right: clamp(16px, 2vw, 40px);
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 6px;
-  z-index: 20;
-  animation: fade-in 1s ease-out 0.3s both;
-}
-
-.menu-toggle {
-  z-index: 2;
-}
-
-.controls-expanded {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 10px;
-  animation: controls-slide-in 0.25s ease-out;
-}
-
-.ctrl-group {
-  display: flex;
-  gap: 6px;
-  padding: 4px;
-  background: rgba(0, 0, 0, 0.4);
+  align-items: center;
+  gap: 0;
+  padding: 5px;
+  background: rgba(0, 0, 0, 0.5);
   border: 1px solid rgba(255, 255, 255, 0.04);
-  border-radius: 14px;
-  backdrop-filter: blur(12px);
+  border-radius: 16px;
+  backdrop-filter: blur(16px);
+  z-index: 20;
+  opacity: 0.35;
+  transition: opacity 0.4s ease, border-color 0.4s ease;
+  animation: fade-in 1s ease-out 0.3s both;
+  overflow: hidden;
 }
 
-@keyframes controls-slide-in {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+.controls-bar:hover {
+  opacity: 1;
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+/* Collapse toggle chevron */
+.bar-toggle {
+  flex-shrink: 0;
+}
+
+.bar-toggle svg {
+  transition: transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.controls-bar.collapsed .bar-toggle svg {
+  transform: rotate(180deg);
+}
+
+/* Collapsible content */
+.bar-content {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 500px;
+  opacity: 1;
+  transition: max-width 0.4s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.25s ease,
+              margin 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  margin-left: 4px;
+  overflow: hidden;
+}
+
+.controls-bar.collapsed .bar-content {
+  max-width: 0;
+  opacity: 0;
+  margin-left: 0;
+}
+
+.ctrl-sep {
+  width: 1px;
+  height: 20px;
+  background: rgba(255, 255, 255, 0.06);
+  margin: 0 2px;
+  flex-shrink: 0;
 }
 
 .ctrl-btn {
-  width: 36px;
-  height: 36px;
+  width: 34px;
+  height: 34px;
   border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(0, 0, 0, 0.3);
-  color: rgba(255, 255, 255, 0.25);
+  border: 1px solid transparent;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.35);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.3s ease;
+  transition: all 0.25s ease;
+  position: relative;
 }
 
 .ctrl-btn:hover {
-  background: rgba(255, 255, 255, 0.06);
-  color: rgba(255, 255, 255, 0.7);
-  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.85);
 }
 
 .ctrl-btn.active {
-  color: rgba(255, 255, 255, 0.7);
-  border-color: rgba(255, 255, 255, 0.15);
-}
-
-.menu-toggle.open {
-  color: rgba(255, 255, 255, 0.6);
-  border-color: rgba(255, 255, 255, 0.12);
-}
-
-.ctrl-btn-danger {
-  border-color: rgba(248, 113, 113, 0.15);
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .ctrl-btn-danger:hover {
   background: rgba(248, 113, 113, 0.15) !important;
   color: #f87171 !important;
-  border-color: rgba(248, 113, 113, 0.3) !important;
+}
+
+/* Tooltip on hover */
+.ctrl-btn::after {
+  content: attr(title);
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  padding: 5px 10px;
+  background: rgba(10, 10, 10, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.5px;
+  color: rgba(255, 255, 255, 0.7);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.ctrl-btn:hover::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
 }
 
 /* ── Reset Confirm Overlay ── */

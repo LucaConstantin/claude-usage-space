@@ -242,6 +242,11 @@ ipcMain.handle('fetch-usage-data', async () => {
   return data;
 });
 
+// IPC: Quit app
+ipcMain.on('quit-app', () => {
+  app.quit();
+});
+
 // IPC: Toggle fullscreen
 ipcMain.on('toggle-fullscreen', () => {
   if (mainWindow) {

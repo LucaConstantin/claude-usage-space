@@ -8,5 +8,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
   detectSessionKey: () => ipcRenderer.invoke('detect-session-key'),
   fetchUsageData: () => ipcRenderer.invoke('fetch-usage-data'),
   toggleFullscreen: () => ipcRenderer.send('toggle-fullscreen'),
-  isFullscreen: () => ipcRenderer.invoke('is-fullscreen')
+  isFullscreen: () => ipcRenderer.invoke('is-fullscreen'),
+  quitApp: () => ipcRenderer.send('quit-app')
 });

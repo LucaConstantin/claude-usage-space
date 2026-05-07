@@ -147,9 +147,8 @@ const dom = {
   resetMoneyBtn: document.getElementById('resetMoneyBtn'),
   colorBtn: document.getElementById('colorBtn'),
   cornerPulse: document.getElementById('cornerPulse'),
-  menuToggleBtn: document.getElementById('menuToggleBtn'),
-  controlsExpanded: document.getElementById('controlsExpanded'),
   refreshBtn: document.getElementById('refreshBtn'),
+  quitBtn: document.getElementById('quitBtn'),
   fullscreenBtn: document.getElementById('fullscreenBtn'),
   logoutBtn: document.getElementById('logoutBtn'),
   statusLine: document.getElementById('statusLine')
@@ -167,6 +166,7 @@ let moneyMode = localStorage.getItem('moneyMode') === 'true';
 let totalMoney = parseFloat(localStorage.getItem('totalMoney')) || 0;
 let lastSessionPct = parseFloat(localStorage.getItem('lastSessionPct')) || 0;
 let displayedMoney = totalMoney;
+let targetMoney = totalMoney;
 let burnRate = 0;
 let lastPct = 0;
 let lastPctTime = 0;
@@ -178,7 +178,8 @@ let moneyTickRunning = false;
 //   Output: $75/MTok - avg response ≈ $2-4
 //   100% session ≈ 100+ exchanges ≈ $1,800 in real API costs
 // This is the actual compute cost Anthropic subsidizes behind the subscription
-const COST_PER_SESSION = 1800;
+const DEFAULT_COST_PER_SESSION = 1800;
+let COST_PER_SESSION = parseFloat(localStorage.getItem('costPerSession')) || DEFAULT_COST_PER_SESSION;
 
 const WARN = 75;
 const DANGER = 90;
@@ -264,6 +265,7 @@ function setupEvents() {
     dom.moneyToggleBtn.classList.toggle('active', moneyMode);
     applyMoneyMode();
     if (moneyMode) {
+      targetMoney = totalMoney;
       displayedMoney = totalMoney;
       renderMoneyDisplay();
     }
@@ -272,10 +274,19 @@ function setupEvents() {
   dom.resetMoneyBtn.addEventListener('click', showResetConfirm);
   dom.colorBtn.addEventListener('click', toggleColorPicker);
 
-  dom.menuToggleBtn.addEventListener('click', () => {
-    const expanded = dom.controlsExpanded.style.display !== 'none';
-    dom.controlsExpanded.style.display = expanded ? 'none' : 'flex';
-    dom.menuToggleBtn.classList.toggle('open', !expanded);
+  dom.quitBtn.addEventListener('click', () => {
+    window.electronAPI.quitApp();
+  });
+
+  // Bar collapse toggle
+  const barToggleBtn = document.getElementById('barToggleBtn');
+  const controlsBar = document.getElementById('controlsBar');
+  const barCollapsed = localStorage.getItem('barCollapsed') === 'true';
+  if (barCollapsed) controlsBar.classList.add('collapsed');
+
+  barToggleBtn.addEventListener('click', () => {
+    controlsBar.classList.toggle('collapsed');
+    localStorage.setItem('barCollapsed', controlsBar.classList.contains('collapsed'));
   });
 
   document.addEventListener('keydown', (e) => {
@@ -306,6 +317,7 @@ function showResetConfirm() {
 
   document.getElementById('confirmReset').addEventListener('click', () => {
     totalMoney = 0;
+    targetMoney = 0;
     displayedMoney = 0;
     lastSessionPct = 0;
     burnRate = 0;
@@ -411,6 +423,56 @@ function toggleColorPicker() {
 }
 
 // ═══════════════════════════════════════════════
+// Rate Config Popup
+// ═══════════════════════════════════════════════
+
+let ratePopup = null;
+
+function toggleRatePopup() {
+  if (ratePopup) { ratePopup.remove(); ratePopup = null; return; }
+
+  const popup = document.createElement('div');
+  popup.className = 'color-popup';
+  popup.innerHTML = `
+    <div class="color-popup-title">Cost per 100% Session ($)</div>
+    <div class="color-hex-row">
+      <input type="number" class="color-hex-input rate-input" value="${COST_PER_SESSION}" min="1" step="50" style="width:120px;" />
+      <button class="color-apply-btn" id="rateApply">Apply</button>
+    </div>
+    <div style="margin-top:10px;font-size:11px;color:rgba(255,255,255,0.25);line-height:1.5;">
+      Default: $${DEFAULT_COST_PER_SESSION.toLocaleString()}<br>
+      How much a full session costs in API credits.
+    </div>
+  `;
+  document.body.appendChild(popup);
+  ratePopup = popup;
+
+  const input = popup.querySelector('.rate-input');
+  const applyBtn = popup.querySelector('#rateApply');
+
+  applyBtn.addEventListener('click', () => {
+    const val = parseFloat(input.value);
+    if (val > 0) {
+      COST_PER_SESSION = val;
+      localStorage.setItem('costPerSession', val);
+    }
+  });
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyBtn.click(); });
+
+  const rateBtn = document.getElementById('rateBtn');
+  const closeHandler = (e) => {
+    if (!popup.contains(e.target) && e.target !== rateBtn) {
+      popup.remove();
+      ratePopup = null;
+      document.removeEventListener('click', closeHandler);
+    }
+  };
+  setTimeout(() => document.addEventListener('click', closeHandler), 0);
+}
+
+document.getElementById('rateBtn').addEventListener('click', toggleRatePopup);
+
+// ═══════════════════════════════════════════════
 // Money Mode
 // ═══════════════════════════════════════════════
 
@@ -419,7 +481,7 @@ function applyMoneyMode() {
     dom.sessionBarWrap.style.display = 'none';
     dom.resetMoneyBtn.style.display = '';
     dom.usageLabel.textContent = 'TOTAL SPENT';
-    if (usageData) renderMoneyDisplay();
+    renderMoneyDisplay();
     startMoneyTick();
   } else {
     dom.sessionBarWrap.style.display = '';
@@ -440,9 +502,23 @@ function renderMoneyDisplay() {
   const whole = Math.floor(displayedMoney);
   const cents = Math.abs(displayedMoney % 1 * 100).toFixed(0).padStart(2, '0');
   const wholeFormatted = whole.toLocaleString('en-US');
-  dom.sessionPct.innerHTML = `$${wholeFormatted}<span class="money-cents">.${cents}</span>`;
-  dom.sessionPct.className = 'usage-pct money-mode';
 
+  // Build digit spans for smooth individual digit transitions
+  const dollarStr = `$${wholeFormatted}`;
+  const centsStr = `.${cents}`;
+
+  let html = '';
+  for (const ch of dollarStr) {
+    if (ch >= '0' && ch <= '9') {
+      html += `<span class="money-digit">${ch}</span>`;
+    } else {
+      html += `<span class="money-sep">${ch}</span>`;
+    }
+  }
+  html += `<span class="money-cents">${centsStr}</span>`;
+
+  dom.sessionPct.innerHTML = html;
+  dom.sessionPct.className = 'usage-pct money-mode';
 }
 
 // Called when new usage data arrives - accumulates cost and recalculates burn rate
@@ -477,26 +553,42 @@ function onNewUsageData(newPct) {
   localStorage.setItem('lastSessionPct', lastSessionPct.toFixed(4));
   lastPct = newPct;
   lastPctTime = now;
-  displayedMoney = totalMoney;
+  targetMoney = totalMoney;
 
-  renderMoneyDisplay();
+  // In money mode the tick loop handles smooth animation
+  // In pct mode we don't touch the display here (updateSessionUI does it)
   updateCornerPulse(newPct);
 }
 
-// Continuous tick - adds money at burn rate between refreshes
+// Continuous tick - smooth lerp animation + burn rate between refreshes
 let lastTickTime = 0;
+const LERP_SPEED = 8; // Higher = faster catch-up (smooth exponential ease)
 
 function moneyTick(now) {
   if (!moneyTickRunning) return;
 
-  if (lastTickTime > 0 && burnRate > 0) {
+  if (lastTickTime > 0) {
     const dt = (now - lastTickTime) / 1000;
+
     // Cap dt to avoid huge jumps if tab was backgrounded
     if (dt < 2) {
-      const increment = burnRate * dt;
-      totalMoney += increment;
-      displayedMoney = totalMoney;
-      renderMoneyDisplay();
+      // Add burn rate to target (continuous spending estimate)
+      if (burnRate > 0) {
+        targetMoney += burnRate * dt;
+        totalMoney = targetMoney;
+      }
+
+      // Smooth lerp: displayedMoney chases targetMoney
+      const diff = targetMoney - displayedMoney;
+      if (Math.abs(diff) > 0.001) {
+        // Exponential ease-out - fast start, smooth finish
+        displayedMoney += diff * (1 - Math.exp(-LERP_SPEED * dt));
+        renderMoneyDisplay();
+      } else if (Math.abs(diff) > 0) {
+        // Snap when close enough to avoid infinite approach
+        displayedMoney = targetMoney;
+        renderMoneyDisplay();
+      }
     }
   }
   lastTickTime = now;
@@ -592,33 +684,41 @@ async function fetchUsageData() {
   dom.statusLine.textContent = 'Fetching...';
   dom.statusLine.style.opacity = '1';
 
-  try {
-    usageData = await window.electronAPI.fetchUsageData();
-    const newPct = usageData.five_hour?.utilization || 0;
+  const MAX_RETRIES = 2;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      usageData = await window.electronAPI.fetchUsageData();
+      const newPct = usageData.five_hour?.utilization || 0;
 
-    // Always track spending data regardless of mode
-    onNewUsageData(newPct);
+      // Always track spending data regardless of mode
+      onNewUsageData(newPct);
 
-    if (!moneyMode) {
-      updateSessionUI();
+      if (!moneyMode) {
+        updateSessionUI();
+      }
+
+      if (showWeekly) updateWeeklyUI();
+      startCountdown();
+
+      const now = new Date();
+      dom.statusLine.textContent = `Updated ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+      setTimeout(() => { dom.statusLine.style.opacity = '0.3'; }, 2000);
+      break; // Success, stop retrying
+    } catch (error) {
+      if (error.message.includes('SessionExpired') || error.message.includes('Unauthorized')) {
+        credentials = { sessionKey: null, organizationId: null };
+        showScreen('login');
+        break;
+      }
+      if (attempt < MAX_RETRIES) {
+        dom.statusLine.textContent = `Retrying... (${attempt + 1})`;
+        await new Promise(r => setTimeout(r, 1500));
+      } else {
+        dom.statusLine.textContent = 'Failed to fetch';
+      }
     }
-
-    if (showWeekly) updateWeeklyUI();
-    startCountdown();
-
-    const now = new Date();
-    dom.statusLine.textContent = `Updated ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-    setTimeout(() => { dom.statusLine.style.opacity = '0.3'; }, 2000);
-  } catch (error) {
-    if (error.message.includes('SessionExpired') || error.message.includes('Unauthorized')) {
-      credentials = { sessionKey: null, organizationId: null };
-      showScreen('login');
-    } else {
-      dom.statusLine.textContent = 'Failed to fetch';
-    }
-  } finally {
-    isFetching = false;
   }
+  isFetching = false;
 }
 
 function startAutoRefresh() {
