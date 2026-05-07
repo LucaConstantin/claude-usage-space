@@ -439,25 +439,48 @@ function toggleRatePopup() {
       <input type="number" class="color-hex-input rate-input" value="${COST_PER_SESSION}" min="1" step="50" style="width:120px;" />
       <button class="color-apply-btn" id="rateApply">Apply</button>
     </div>
-    <div style="margin-top:10px;font-size:11px;color:rgba(255,255,255,0.25);line-height:1.5;">
-      Default: $${DEFAULT_COST_PER_SESSION.toLocaleString()}<br>
-      How much a full session costs in API credits.
+    <div style="margin-top:6px;font-size:11px;color:rgba(255,255,255,0.2);">
+      Default: $${DEFAULT_COST_PER_SESSION.toLocaleString()}
+    </div>
+
+    <div class="color-popup-title" style="margin-top:16px;">Starting Amount ($)</div>
+    <div class="color-hex-row">
+      <input type="number" class="color-hex-input start-money-input" value="${totalMoney.toFixed(2)}" min="0" step="10" style="width:120px;" />
+      <button class="color-apply-btn" id="startMoneyApply">Set</button>
+    </div>
+    <div style="margin-top:6px;font-size:11px;color:rgba(255,255,255,0.2);">
+      Set current total to a specific amount.
     </div>
   `;
   document.body.appendChild(popup);
   ratePopup = popup;
 
-  const input = popup.querySelector('.rate-input');
-  const applyBtn = popup.querySelector('#rateApply');
+  const rateInput = popup.querySelector('.rate-input');
+  const rateApplyBtn = popup.querySelector('#rateApply');
 
-  applyBtn.addEventListener('click', () => {
-    const val = parseFloat(input.value);
+  rateApplyBtn.addEventListener('click', () => {
+    const val = parseFloat(rateInput.value);
     if (val > 0) {
       COST_PER_SESSION = val;
       localStorage.setItem('costPerSession', val);
     }
   });
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyBtn.click(); });
+  rateInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') rateApplyBtn.click(); });
+
+  const startInput = popup.querySelector('.start-money-input');
+  const startApplyBtn = popup.querySelector('#startMoneyApply');
+
+  startApplyBtn.addEventListener('click', () => {
+    const val = parseFloat(startInput.value);
+    if (!isNaN(val) && val >= 0) {
+      totalMoney = val;
+      targetMoney = val;
+      displayedMoney = val;
+      localStorage.setItem('totalMoney', val.toFixed(4));
+      if (moneyMode) renderMoneyDisplay();
+    }
+  });
+  startInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') startApplyBtn.click(); });
 
   const rateBtn = document.getElementById('rateBtn');
   const closeHandler = (e) => {
@@ -693,6 +716,9 @@ async function fetchUsageData() {
       // Always track spending data regardless of mode
       onNewUsageData(newPct);
 
+      // Always update timers (resets_at / countdown)
+      updateTimers();
+
       if (!moneyMode) {
         updateSessionUI();
       }
@@ -737,6 +763,13 @@ function stopAutoRefresh() {
 // ═══════════════════════════════════════════════
 // UI
 // ═══════════════════════════════════════════════
+
+function updateTimers() {
+  if (!usageData) return;
+  const resetsAt = usageData.five_hour?.resets_at;
+  dom.sessionResetTime.textContent = formatResetTime(resetsAt);
+  dom.sessionCountdown.textContent = formatCountdown(resetsAt);
+}
 
 function updateSessionUI() {
   if (!usageData) return;
