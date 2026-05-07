@@ -1,0 +1,46 @@
+{
+  "name": "claude-usage-space",
+  "version": "1.0.0",
+  "description": "Deep space Claude usage monitor",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "cross-env NODE_ENV=development electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "^28.3.3",
+    "electron-builder": "^24.9.1"
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0"
+  },
+  "build": {
+    "appId": "com.claude-usage-space.app",
+    "productName": "Claude Usage Space",
+    "win": {
+      "target": ["nsis", "portable"],
+      "icon": "assets/icon.png",
+      "signingHashAlgorithms": [],
+      "sign": null
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "artifactName": "${productName}-${version}-Setup.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable.${ext}"
+    },
+    "files": [
+      "**/*",
+      "!refrence/**",
+      "!*.md",
+      "!generate-icon.js"
+    ]
+  }
+}
