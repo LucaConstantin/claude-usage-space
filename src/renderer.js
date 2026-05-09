@@ -32,6 +32,51 @@ let lastMediaKey = '';
 let audioCaptureActive = false;
 let bassFreqData = null;
 
+// ── Intelligent Music Analysis State ──
+const songAnalysis = {
+  // Song timeline awareness
+  songStartTime: 0,         // when current song started playing
+  songDuration: 0,          // estimated duration (if available)
+  introPhase: true,         // are we in the intro? (first ~15s)
+  introFadeDuration: 8000,  // ms to ramp up from gentle to full
+
+  // Energy profiling - learns the song's character
+  energyHistory: [],        // rolling window of energy samples
+  energyHistoryMax: 300,    // ~5 seconds at 60fps
+  medianEnergy: 0,          // median energy of the song so far
+  peakEnergy: 0,            // highest energy seen in this song
+  energyFloor: 1,           // lowest sustained energy (silence floor)
+
+  // BPM detection
+  bpm: 0,
+  bpmConfidence: 0,
+  beatTimes: [],            // timestamps of detected beats
+  lastBeatTime: 0,
+  beatInterval: 0,          // ms between beats (from BPM)
+
+  // Adaptive scaling
+  effectIntensity: 0,       // 0-1, how intense effects should be right now
+  smoothIntensity: 0,       // smoothed version for rendering
+  volumeNormFactor: 1,      // multiplier to normalize quiet vs loud songs
+
+  reset() {
+    this.songStartTime = Date.now();
+    this.introPhase = true;
+    this.energyHistory = [];
+    this.medianEnergy = 0;
+    this.peakEnergy = 0;
+    this.energyFloor = 1;
+    this.bpm = 0;
+    this.bpmConfidence = 0;
+    this.beatTimes = [];
+    this.lastBeatTime = 0;
+    this.beatInterval = 0;
+    this.effectIntensity = 0;
+    this.smoothIntensity = 0;
+    this.volumeNormFactor = 1;
+  }
+};
+
 function resizeCanvas() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
@@ -137,8 +182,9 @@ function drawStars() {
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
   // Bass corner glow - colored pulse from corners on heavy bass
+  // Glow is modulated by song intelligence - gentler during intros
   if (bassGlowEnabled && bassSmooth > 0.06) {
-    const bAlpha = bassSmooth * 0.18;
+    const bAlpha = bassSmooth * 0.22 * (0.5 + songAnalysis.smoothIntensity * 0.5);
     const gc = getGlowRGB();
     const w = canvas.width, h = canvas.height;
     const cornerRadius = Math.max(w, h) * 0.5;
@@ -1036,6 +1082,11 @@ async function pollMediaInfo() {
     lastMediaKey = mediaKey;
     currentMedia = info;
 
+    // Reset song analysis on song change - fresh analysis for new track
+    if (songChanged) {
+      songAnalysis.reset();
+    }
+
     showNowPlaying(info, songChanged);
 
     if (songChanged && info.thumb) {
@@ -1187,7 +1238,7 @@ function stopAudioCapture() {
   bassFreqData = null;
 }
 
-// ── Bass Analysis (called every frame from animateStarfield) ──
+// ── Intelligent Bass Analysis (called every frame from animateStarfield) ──
 
 function updateBassLevel() {
   if (!analyser || !musicEnabled || !bassFreqData) {
@@ -1196,45 +1247,140 @@ function updateBassLevel() {
     bassHit *= 0.85;
     peakBass *= 0.95;
     bassAvg *= 0.99;
+    songAnalysis.smoothIntensity *= 0.95;
     return;
   }
 
   analyser.getByteFrequencyData(bassFreqData);
 
+  // ── Frequency band analysis ──
   // Sub-bass (bins 0-1, ~0-375Hz) and bass (bins 2-4, ~375-940Hz)
   let subBass = 0;
   let bass = 0;
+  let midEnergy = 0;
+  let totalEnergy = 0;
   for (let i = 0; i < 2; i++) subBass += bassFreqData[i];
   for (let i = 0; i < 5; i++) bass += bassFreqData[i];
+  for (let i = 5; i < 20; i++) midEnergy += bassFreqData[i];
+  for (let i = 0; i < bassFreqData.length; i++) totalEnergy += bassFreqData[i];
   subBass /= (2 * 255);
   bass /= (5 * 255);
+  midEnergy /= (15 * 255);
+  totalEnergy /= (bassFreqData.length * 255);
 
   const rawBass = Math.min(1, subBass * 0.65 + bass * 0.35);
 
-  // Running average - tracks the "floor" level
-  bassAvg = bassAvg * 0.97 + rawBass * 0.03;
-
-  // Transient = how much above average (this is what you "feel")
-  const transient = Math.max(0, rawBass - bassAvg * 0.85);
-
-  // bassHit: sharp impulse that decays fast - each beat is distinct
-  if (transient > bassHit) {
-    bassHit = transient; // instant attack
-  } else {
-    bassHit *= 0.82; // fast decay - drops between beats
+  // ── Energy profiling - learn the song's character ──
+  songAnalysis.energyHistory.push(totalEnergy);
+  if (songAnalysis.energyHistory.length > songAnalysis.energyHistoryMax) {
+    songAnalysis.energyHistory.shift();
   }
 
-  bassLevel = rawBass;
+  // Update median energy every ~30 frames for efficiency
+  if (songAnalysis.energyHistory.length % 30 === 0 && songAnalysis.energyHistory.length > 30) {
+    const sorted = [...songAnalysis.energyHistory].sort((a, b) => a - b);
+    songAnalysis.medianEnergy = sorted[Math.floor(sorted.length * 0.5)];
+    songAnalysis.energyFloor = sorted[Math.floor(sorted.length * 0.1)];
+    if (totalEnergy > songAnalysis.peakEnergy) songAnalysis.peakEnergy = totalEnergy;
+  }
 
-  // bassSmooth drives stars & glow - use transient, not absolute
-  // This way constant bass = calm, beat hits = pulse
-  bassSmooth = bassHit * 2.5;
+  // Volume normalization: quiet songs get boosted, loud songs get tamed
+  if (songAnalysis.medianEnergy > 0.01) {
+    // Target median of ~0.25 - normalize around that
+    const targetMedian = 0.25;
+    songAnalysis.volumeNormFactor = songAnalysis.volumeNormFactor * 0.99 +
+      (Math.min(2.5, Math.max(0.4, targetMedian / songAnalysis.medianEnergy))) * 0.01;
+  }
+
+  // ── Intro phase detection ──
+  const timeSinceSongStart = Date.now() - songAnalysis.songStartTime;
+  songAnalysis.introPhase = timeSinceSongStart < songAnalysis.introFadeDuration;
+
+  // Intro ramp: starts at 0.3 (already noticeable), reaches 1 after introFadeDuration
+  let introRamp = 1;
+  if (songAnalysis.introPhase) {
+    const t = Math.min(1, timeSinceSongStart / songAnalysis.introFadeDuration);
+    introRamp = 0.3 + t * 0.7; // starts at 30% intensity, ramps to full
+  }
+
+  // ── BPM detection via beat onset tracking ──
+  const normalizedBass = Math.min(1, rawBass * songAnalysis.volumeNormFactor);
+
+  // Running average with normalization awareness
+  bassAvg = bassAvg * 0.97 + normalizedBass * 0.03;
+
+  // Transient detection - how far above the running average
+  const transient = Math.max(0, normalizedBass - bassAvg * 0.85);
+
+  // Beat onset detection for BPM
+  const now = performance.now();
+  const minBeatGap = 200; // max 300 BPM
+  if (transient > 0.08 && (now - songAnalysis.lastBeatTime) > minBeatGap) {
+    songAnalysis.beatTimes.push(now);
+    songAnalysis.lastBeatTime = now;
+
+    // Keep last 16 beats for BPM calculation
+    if (songAnalysis.beatTimes.length > 16) songAnalysis.beatTimes.shift();
+
+    // Calculate BPM from beat intervals
+    if (songAnalysis.beatTimes.length >= 4) {
+      const intervals = [];
+      for (let i = 1; i < songAnalysis.beatTimes.length; i++) {
+        intervals.push(songAnalysis.beatTimes[i] - songAnalysis.beatTimes[i - 1]);
+      }
+      // Sort and take median interval (robust to outliers)
+      intervals.sort((a, b) => a - b);
+      const medianInterval = intervals[Math.floor(intervals.length / 2)];
+
+      if (medianInterval > 0) {
+        const detectedBPM = 60000 / medianInterval;
+        // Only accept reasonable BPM range (60-200)
+        if (detectedBPM >= 60 && detectedBPM <= 200) {
+          songAnalysis.bpm = songAnalysis.bpm * 0.7 + detectedBPM * 0.3;
+          songAnalysis.beatInterval = 60000 / songAnalysis.bpm;
+          songAnalysis.bpmConfidence = Math.min(1, songAnalysis.beatTimes.length / 8);
+        }
+      }
+    }
+  }
+
+  // ── Adaptive effect intensity ──
+  // Combines: intro ramp + energy relative to song's own range + normalization
+  let energyRelative = 0;
+  if (songAnalysis.peakEnergy > songAnalysis.energyFloor + 0.01) {
+    energyRelative = (totalEnergy - songAnalysis.energyFloor) /
+      (songAnalysis.peakEnergy - songAnalysis.energyFloor);
+    energyRelative = Math.max(0, Math.min(1, energyRelative));
+  } else {
+    energyRelative = Math.min(1, totalEnergy * 4);
+  }
+
+  // Effect intensity: intro ramp * energy position in song's own dynamic range
+  // Songs that are consistently loud won't produce over-the-top effects
+  // Songs that build up will naturally ramp the effects
+  songAnalysis.effectIntensity = introRamp * (0.5 + energyRelative * 0.5);
+  songAnalysis.smoothIntensity += (songAnalysis.effectIntensity - songAnalysis.smoothIntensity) * 0.12;
+
+  // ── Apply to bass-reactive state (what the visuals use) ──
+  bassLevel = normalizedBass;
+
+  // bassHit: sharp impulse, scaled by song intelligence
+  if (transient > bassHit) {
+    bassHit = transient * (0.5 + songAnalysis.smoothIntensity * 0.5);
+  } else {
+    bassHit *= 0.82;
+  }
+
+  // bassSmooth: drives stars & glow, modulated by adaptive intensity
+  bassSmooth = bassHit * 3.0 * (0.6 + songAnalysis.smoothIntensity * 0.4);
   bassSmooth = Math.min(1, bassSmooth);
 
-  // Peak detection for screen shake kicks
-  if (transient > peakBass * 1.2 && transient > 0.08) {
+  // Peak detection for screen shake - gentler during intro but still punchy
+  const shakeThreshold = songAnalysis.introPhase ? 0.12 : 0.07;
+  const shakeScale = 0.5 + songAnalysis.smoothIntensity * 0.5;
+  if (transient > peakBass * 1.2 && transient > shakeThreshold) {
     peakBass = transient;
-    onBassKick(transient * 2);
+    onBassKick(transient * 2.5 * shakeScale);
   }
   peakBass *= 0.9;
 }
@@ -1244,9 +1390,10 @@ function updateBassLevel() {
 function onBassKick(intensity) {
   // Scale shake with screen size for bigger impact on large displays
   const screenScale = Math.max(1, Math.min(2, canvas.height / 800));
-  const force = Math.min(14 * screenScale, intensity * 22 * screenScale);
+  const maxForce = 12 * screenScale;
+  const force = Math.min(maxForce, intensity * 20 * screenScale);
   shakeY = -force;
-  shakeVelocity = force * 0.6;
+  shakeVelocity = force * 0.55;
 }
 
 function updateScreenShake() {

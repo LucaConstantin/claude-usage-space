@@ -373,24 +373,76 @@ ipcMain.handle('get-media-info', async () => {
   });
 });
 
-// IPC: Fetch album art fallback (iTunes Search API)
+// IPC: Fetch album art fallback - multi-source: Deezer → iTunes → MusicBrainz
 ipcMain.handle('fetch-album-art', async (event, title, artist) => {
+  const { net } = require('electron');
+
+  // Clean search terms: remove feat., (remix), [live], etc.
+  function cleanQuery(str) {
+    if (!str) return '';
+    return str
+      .replace(/\s*[\(\[][^)\]]*[\)\]]\s*/g, ' ')  // remove (anything) and [anything]
+      .replace(/\s*(feat\.?|ft\.?|featuring)\s+.*/i, '')  // remove feat. X
+      .replace(/\s*[-–]\s*(official|music|lyric|audio|video).*/i, '')  // remove - Official Video etc.
+      .replace(/[^\w\s]/g, ' ')  // remove special chars
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  const cleanTitle = cleanQuery(title);
+  const cleanArtist = cleanQuery(artist);
+
+  // 1. Try Deezer (best coverage, no API key needed)
   try {
-    const query = encodeURIComponent(`${artist} ${title}`.trim());
-    const url = `https://itunes.apple.com/search?term=${query}&media=music&limit=1`;
-    const response = await require('electron').net.fetch(url);
-    if (!response.ok) return null;
-    const data = await response.json();
-    if (data && data.results && data.results.length > 0) {
-      const artUrl = data.results[0].artworkUrl100;
-      if (artUrl) {
-        return { url: artUrl.replace('100x100bb', '600x600bb') };
+    const q = encodeURIComponent(`${cleanArtist} ${cleanTitle}`);
+    const resp = await net.fetch(`https://api.deezer.com/search?q=${q}&limit=3`);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data && data.data && data.data.length > 0) {
+        // Find best match - prefer exact artist match
+        const lowerArtist = cleanArtist.toLowerCase();
+        const match = data.data.find(r =>
+          r.artist && r.artist.name.toLowerCase().includes(lowerArtist)
+        ) || data.data[0];
+        const artUrl = match.album && (match.album.cover_xl || match.album.cover_big || match.album.cover_medium);
+        if (artUrl) return { url: artUrl };
       }
     }
-    return null;
-  } catch {
-    return null;
+  } catch {}
+
+  // 2. Fallback: iTunes
+  try {
+    const q = encodeURIComponent(`${cleanArtist} ${cleanTitle}`);
+    const resp = await net.fetch(`https://itunes.apple.com/search?term=${q}&media=music&limit=3`);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data && data.results && data.results.length > 0) {
+        const lowerArtist = cleanArtist.toLowerCase();
+        const match = data.results.find(r =>
+          r.artistName && r.artistName.toLowerCase().includes(lowerArtist)
+        ) || data.results[0];
+        const artUrl = match.artworkUrl100;
+        if (artUrl) return { url: artUrl.replace('100x100bb', '600x600bb') };
+      }
+    }
+  } catch {}
+
+  // 3. Last resort: try with just the title (handles cases where artist name is different)
+  if (cleanArtist) {
+    try {
+      const q = encodeURIComponent(cleanTitle);
+      const resp = await net.fetch(`https://api.deezer.com/search?q=${q}&limit=1`);
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data && data.data && data.data.length > 0) {
+          const artUrl = data.data[0].album && (data.data[0].album.cover_xl || data.data[0].album.cover_big);
+          if (artUrl) return { url: artUrl };
+        }
+      }
+    } catch {}
   }
+
+  return null;
 });
 
 // App lifecycle
