@@ -9,5 +9,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   fetchUsageData: () => ipcRenderer.invoke('fetch-usage-data'),
   toggleFullscreen: () => ipcRenderer.send('toggle-fullscreen'),
   isFullscreen: () => ipcRenderer.invoke('is-fullscreen'),
-  quitApp: () => ipcRenderer.send('quit-app')
+  quitApp: () => ipcRenderer.send('quit-app'),
+  getMediaInfo: () => ipcRenderer.invoke('get-media-info'),
+  fetchAlbumArt: (title, artist) => ipcRenderer.invoke('fetch-album-art', title, artist)
 });

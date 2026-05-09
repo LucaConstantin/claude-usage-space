@@ -10,6 +10,28 @@ const STAR_COUNT = 200;
 const SPEED = 0.4;
 let centerX, centerY;
 
+// Bass-reactive state (set by music system)
+let bassSmooth = 0;
+let bassLevel = 0;
+let peakBass = 0;
+let themeColor = null; // { r, g, b } from album art
+let shakeY = 0;
+let shakeVelocity = 0;
+let bassAvg = 0;
+let bassHit = 0;
+let glowColor = localStorage.getItem('glowColor') || 'auto';
+let bassGlowEnabled = localStorage.getItem('bassGlowEnabled') !== 'false';
+
+// Music state (must be before animateStarfield runs)
+let currentMedia = null;
+let mediaPollingInterval = null;
+let audioStream = null;
+let audioCtx = null;
+let analyser = null;
+let lastMediaKey = '';
+let audioCaptureActive = false;
+let bassFreqData = null;
+
 function resizeCanvas() {
   canvas.width = window.innerWidth;
   canvas.height = window.innerHeight;
@@ -36,11 +58,14 @@ function initStars() {
 }
 
 function updateStars() {
+  // Bass multiplier: stars accelerate on bass hits
+  const bassSpeedMult = 1 + bassSmooth * 4;
+
   for (let i = 0; i < stars.length; i++) {
     const s = stars[i];
     s.prevX = (s.x / s.z) * 500 + centerX;
     s.prevY = (s.y / s.z) * 500 + centerY;
-    s.z -= SPEED * 2;
+    s.z -= SPEED * 2 * bassSpeedMult;
     if (s.z <= 1) { stars[i] = createStar(false); continue; }
     const sx = (s.x / s.z) * 500 + centerX;
     const sy = (s.y / s.z) * 500 + centerY;
@@ -51,15 +76,20 @@ function updateStars() {
 }
 
 function drawStars() {
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+  // Faster trail fade on bass for sharper streaks
+  const trailFade = 0.2 + bassSmooth * 0.12;
+  ctx.fillStyle = `rgba(0, 0, 0, ${trailFade})`;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Bass glow multiplier for star size and brightness
+  const bassGlow = 1 + bassSmooth * 0.8;
 
   for (const s of stars) {
     const sx = (s.x / s.z) * 500 + centerX;
     const sy = (s.y / s.z) * 500 + centerY;
     const depth = 1 - s.z / 1200;
-    const size = Math.max(0.2, depth * 2.8);
-    const alpha = Math.min(1, depth * 1.4) * s.brightness;
+    const size = Math.max(0.2, depth * 2.8 * bassGlow);
+    const alpha = Math.min(1, depth * 1.4 * bassGlow) * s.brightness;
 
     // Fade out stars near center so text is readable
     const dx = (sx - centerX) / canvas.width;
@@ -105,9 +135,28 @@ function drawStars() {
   grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Bass corner glow - colored pulse from corners on heavy bass
+  if (bassGlowEnabled && bassSmooth > 0.06) {
+    const bAlpha = bassSmooth * 0.18;
+    const gc = getGlowRGB();
+    const w = canvas.width, h = canvas.height;
+    const cornerRadius = Math.max(w, h) * 0.5;
+    const corners = [[0, 0], [w, 0], [0, h], [w, h]];
+    for (const [cx, cy] of corners) {
+      const cg2 = ctx.createRadialGradient(cx, cy, 0, cx, cy, cornerRadius);
+      cg2.addColorStop(0, `rgba(${gc.r}, ${gc.g}, ${gc.b}, ${bAlpha})`);
+      cg2.addColorStop(0.4, `rgba(${gc.r}, ${gc.g}, ${gc.b}, ${bAlpha * 0.3})`);
+      cg2.addColorStop(1, 'rgba(0, 0, 0, 0)');
+      ctx.fillStyle = cg2;
+      ctx.fillRect(0, 0, w, h);
+    }
+  }
 }
 
 function animateStarfield() {
+  updateBassLevel();
+  updateScreenShake();
   updateStars();
   drawStars();
   requestAnimationFrame(animateStarfield);
@@ -142,16 +191,15 @@ const dom = {
   weeklyBar: document.getElementById('weeklyBar'),
   weeklyCountdown: document.getElementById('weeklyCountdown'),
   weeklyResetTime: document.getElementById('weeklyResetTime'),
-  weeklyToggleBtn: document.getElementById('weeklyToggleBtn'),
-  moneyToggleBtn: document.getElementById('moneyToggleBtn'),
-  resetMoneyBtn: document.getElementById('resetMoneyBtn'),
-  colorBtn: document.getElementById('colorBtn'),
   cornerPulse: document.getElementById('cornerPulse'),
   refreshBtn: document.getElementById('refreshBtn'),
   quitBtn: document.getElementById('quitBtn'),
-  fullscreenBtn: document.getElementById('fullscreenBtn'),
-  logoutBtn: document.getElementById('logoutBtn'),
-  statusLine: document.getElementById('statusLine')
+  settingsBtn: document.getElementById('settingsBtn'),
+  statusLine: document.getElementById('statusLine'),
+  musicWidget: document.getElementById('musicWidget'),
+  musicArt: document.getElementById('musicArt'),
+  musicTitle: document.getElementById('musicTitle'),
+  musicArtist: document.getElementById('musicArtist')
 };
 
 let credentials = null;
@@ -161,6 +209,7 @@ let autoRefreshInterval = null;
 let isFetching = false;
 let showWeekly = localStorage.getItem('showWeekly') === 'true';
 let moneyMode = localStorage.getItem('moneyMode') === 'true';
+let musicEnabled = localStorage.getItem('musicEnabled') === 'true';
 
 // Money mode state - accumulates across sessions
 let totalMoney = parseFloat(localStorage.getItem('totalMoney')) || 0;
@@ -209,11 +258,13 @@ async function init() {
   // Restore saved toggle states
   if (showWeekly) {
     dom.weeklySection.style.display = 'block';
-    dom.weeklyToggleBtn.classList.add('active');
   }
   if (moneyMode) {
-    dom.moneyToggleBtn.classList.add('active');
     applyMoneyMode();
+  }
+  if (musicEnabled) {
+    startMediaPolling();
+    startAudioCapture();
   }
 
   if (credentials.sessionKey && credentials.organizationId) {
@@ -239,40 +290,7 @@ function setupEvents() {
     dom.refreshBtn.classList.remove('spinning');
   });
 
-  dom.fullscreenBtn.addEventListener('click', () => {
-    window.electronAPI.toggleFullscreen();
-  });
-
-  dom.logoutBtn.addEventListener('click', async () => {
-    await window.electronAPI.deleteCredentials();
-    credentials = { sessionKey: null, organizationId: null };
-    stopAutoRefresh();
-    if (countdownInterval) clearInterval(countdownInterval);
-    showScreen('login');
-  });
-
-  dom.weeklyToggleBtn.addEventListener('click', () => {
-    showWeekly = !showWeekly;
-    localStorage.setItem('showWeekly', showWeekly);
-    dom.weeklySection.style.display = showWeekly ? 'block' : 'none';
-    dom.weeklyToggleBtn.classList.toggle('active', showWeekly);
-    if (showWeekly && usageData) updateWeeklyUI();
-  });
-
-  dom.moneyToggleBtn.addEventListener('click', () => {
-    moneyMode = !moneyMode;
-    localStorage.setItem('moneyMode', moneyMode);
-    dom.moneyToggleBtn.classList.toggle('active', moneyMode);
-    applyMoneyMode();
-    if (moneyMode) {
-      targetMoney = totalMoney;
-      displayedMoney = totalMoney;
-      renderMoneyDisplay();
-    }
-  });
-
-  dom.resetMoneyBtn.addEventListener('click', showResetConfirm);
-  dom.colorBtn.addEventListener('click', toggleColorPicker);
+  dom.settingsBtn.addEventListener('click', toggleSettings);
 
   dom.quitBtn.addEventListener('click', () => {
     window.electronAPI.quitApp();
@@ -339,68 +357,187 @@ let colorPopup = null;
 function applyFontColor(color) {
   fontColor = color;
   localStorage.setItem('fontColor', color);
-  dom.sessionPct.style.color = color;
+  // Only apply if music theming isn't overriding
+  if (!musicEnabled || !themeColor || !currentMedia || currentMedia.status !== 'Playing') {
+    dom.sessionPct.style.color = color;
+  }
+}
+
+function getGlowRGB() {
+  if (glowColor === 'auto' && themeColor) return themeColor;
+  if (glowColor !== 'auto' && /^#[0-9a-fA-F]{6}$/.test(glowColor)) {
+    return {
+      r: parseInt(glowColor.slice(1, 3), 16),
+      g: parseInt(glowColor.slice(3, 5), 16),
+      b: parseInt(glowColor.slice(5, 7), 16)
+    };
+  }
+  return { r: 100, g: 100, b: 255 };
 }
 
 function applyFontSize(size) {
   fontSize = size;
   localStorage.setItem('fontSize', size);
   dom.sessionPct.style.fontSize = `calc(${size / 100} * ${moneyMode ? 'clamp(64px, 12vw, 280px)' : 'clamp(72px, 14vw, 320px)'})`;
+  document.documentElement.style.setProperty('--font-scale', size / 100);
 }
 
 // Apply saved settings on startup
 setTimeout(() => {
   dom.sessionPct.style.color = fontColor;
+  document.documentElement.style.setProperty('--font-scale', fontSize / 100);
   if (fontSize !== 100) applyFontSize(fontSize);
 }, 0);
 
-function toggleColorPicker() {
-  if (colorPopup) { colorPopup.remove(); colorPopup = null; return; }
+// ═══════════════════════════════════════════════
+// Unified Settings Popup
+// ═══════════════════════════════════════════════
+
+let settingsPopup = null;
+
+function toggleSettings() {
+  if (settingsPopup) { settingsPopup.remove(); settingsPopup = null; return; }
 
   const presets = ['#ffffff', '#f87171', '#fbbf24', '#34d399', '#60a5fa', '#a78bfa', '#f472b6', '#fb923c'];
+  const glowPresets = ['#f87171', '#fbbf24', '#34d399', '#60a5fa', '#a78bfa', '#f472b6', '#fb923c'];
 
   const popup = document.createElement('div');
-  popup.className = 'color-popup';
-  popup.innerHTML = `
-    <div class="color-popup-title">Font Color</div>
-    <div class="color-presets">
-      ${presets.map(c => `<div class="color-swatch${c === fontColor ? ' active' : ''}" data-color="${c}" style="background:${c}"></div>`).join('')}
-    </div>
-    <div class="color-hex-row">
-      <input type="text" class="color-hex-input" value="${fontColor}" placeholder="#ffffff" maxlength="7" />
-      <button class="color-apply-btn">Apply</button>
-    </div>
-    <div class="color-popup-title" style="margin-top:16px;">Font Size</div>
-    <div class="font-size-row">
-      <input type="range" class="font-size-slider" min="50" max="200" step="5" value="${fontSize}" />
-      <span class="font-size-val">${fontSize}%</span>
-    </div>
-  `;
-  document.body.appendChild(popup);
-  colorPopup = popup;
+  popup.className = 'settings-popup';
 
-  // Preset clicks
-  popup.querySelectorAll('.color-swatch').forEach(sw => {
+  let html = `
+    <div class="settings-section">
+      <div class="settings-title">Features</div>
+      <div class="settings-row"><span class="settings-label">Music Visualization</span><div class="toggle-switch${musicEnabled ? ' active' : ''}" data-toggle="music"></div></div>
+      <div class="settings-row"><span class="settings-label">Bass Corner Glow</span><div class="toggle-switch${bassGlowEnabled ? ' active' : ''}" data-toggle="bassGlow"></div></div>
+      <div class="settings-row"><span class="settings-label">Money Mode</span><div class="toggle-switch${moneyMode ? ' active' : ''}" data-toggle="money"></div></div>
+      <div class="settings-row"><span class="settings-label">Weekly View</span><div class="toggle-switch${showWeekly ? ' active' : ''}" data-toggle="weekly"></div></div>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-title">Bass Glow Color</div>
+      <div class="color-presets">
+        <div class="color-swatch glow-swatch${glowColor === 'auto' ? ' active' : ''}" data-glow="auto" style="background:linear-gradient(135deg,#60a5fa,#a78bfa,#f472b6);position:relative;overflow:hidden;">
+          <span style="font-size:9px;color:#fff;position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-weight:600;">A</span>
+        </div>
+        ${glowPresets.map(c => `<div class="color-swatch glow-swatch${glowColor === c ? ' active' : ''}" data-glow="${c}" style="background:${c}"></div>`).join('')}
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-title">Font</div>
+      <div class="color-presets" style="margin-bottom:10px;">
+        ${presets.map(c => `<div class="color-swatch font-swatch${c === fontColor ? ' active' : ''}" data-color="${c}" style="background:${c}"></div>`).join('')}
+      </div>
+      <div class="color-hex-row" style="margin-bottom:14px;">
+        <input type="text" class="color-hex-input font-hex" value="${fontColor}" placeholder="#ffffff" maxlength="7" />
+        <button class="color-apply-btn font-apply-btn">Apply</button>
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">Size</span>
+        <span class="font-size-val" style="min-width:40px;text-align:right;font-family:'JetBrains Mono',monospace;font-size:12px;color:rgba(255,255,255,0.5);">${fontSize}%</span>
+      </div>
+      <div class="font-size-row" style="margin-top:4px;">
+        <input type="range" class="font-size-slider" min="50" max="200" step="5" value="${fontSize}" />
+      </div>
+    </div>`;
+
+  if (moneyMode) {
+    html += `
+    <div class="settings-section">
+      <div class="settings-title">Money Config</div>
+      <div class="settings-row" style="gap:8px;">
+        <span class="settings-label" style="white-space:nowrap;">$/session</span>
+        <div class="color-hex-row" style="flex:1;">
+          <input type="number" class="color-hex-input rate-input" value="${COST_PER_SESSION}" min="1" step="50" style="width:80px;" />
+          <button class="color-apply-btn rate-apply">Set</button>
+        </div>
+      </div>
+      <div class="settings-row" style="gap:8px;">
+        <span class="settings-label" style="white-space:nowrap;">Start $</span>
+        <div class="color-hex-row" style="flex:1;">
+          <input type="number" class="color-hex-input start-input" value="${totalMoney.toFixed(2)}" min="0" step="10" style="width:80px;" />
+          <button class="color-apply-btn start-apply">Set</button>
+        </div>
+      </div>
+      <button class="settings-action-btn danger" id="settingsResetMoney" style="width:100%;margin-top:8px;">Reset Spending Counter</button>
+    </div>`;
+  }
+
+  html += `
+    <div class="settings-section" style="border:none;margin:0;padding:0;">
+      <div class="settings-actions">
+        <button class="settings-action-btn" id="settingsFullscreen">Fullscreen</button>
+        <button class="settings-action-btn danger" id="settingsLogout">Log out</button>
+      </div>
+    </div>`;
+
+  popup.innerHTML = html;
+  document.body.appendChild(popup);
+  settingsPopup = popup;
+
+  // ── Toggle switches ──
+  popup.querySelectorAll('.toggle-switch').forEach(sw => {
     sw.addEventListener('click', () => {
-      applyFontColor(sw.dataset.color);
-      popup.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('active'));
-      sw.classList.add('active');
-      popup.querySelector('.color-hex-input').value = sw.dataset.color;
+      const key = sw.dataset.toggle;
+      sw.classList.toggle('active');
+      const on = sw.classList.contains('active');
+
+      if (key === 'music') {
+        musicEnabled = on;
+        localStorage.setItem('musicEnabled', on);
+        if (on) { startMediaPolling(); startAudioCapture(); }
+        else { stopMediaPolling(); stopAudioCapture(); hideNowPlaying(); bassLevel = 0; bassSmooth = 0; peakBass = 0; themeColor = null; shakeY = 0; dom.sessionPct.style.color = fontColor; dom.sessionPct.style.textShadow = ''; }
+      } else if (key === 'bassGlow') {
+        bassGlowEnabled = on;
+        localStorage.setItem('bassGlowEnabled', on);
+      } else if (key === 'money') {
+        moneyMode = on;
+        localStorage.setItem('moneyMode', on);
+        applyMoneyMode();
+        if (on) { targetMoney = totalMoney; displayedMoney = totalMoney; renderMoneyDisplay(); }
+        // Rebuild popup to show/hide money config
+        settingsPopup.remove(); settingsPopup = null; toggleSettings();
+      } else if (key === 'weekly') {
+        showWeekly = on;
+        localStorage.setItem('showWeekly', on);
+        dom.weeklySection.style.display = on ? 'block' : 'none';
+        if (on && usageData) updateWeeklyUI();
+      }
     });
   });
 
-  // Hex input
-  const input = popup.querySelector('.color-hex-input');
-  const applyBtn = popup.querySelector('.color-apply-btn');
-  applyBtn.addEventListener('click', () => {
-    let hex = input.value.trim();
+  // ── Glow color swatches ──
+  popup.querySelectorAll('.glow-swatch').forEach(sw => {
+    sw.addEventListener('click', () => {
+      glowColor = sw.dataset.glow;
+      localStorage.setItem('glowColor', glowColor);
+      popup.querySelectorAll('.glow-swatch').forEach(s => s.classList.remove('active'));
+      sw.classList.add('active');
+    });
+  });
+
+  // ── Font color swatches ──
+  popup.querySelectorAll('.font-swatch').forEach(sw => {
+    sw.addEventListener('click', () => {
+      applyFontColor(sw.dataset.color);
+      popup.querySelectorAll('.font-swatch').forEach(s => s.classList.remove('active'));
+      sw.classList.add('active');
+      popup.querySelector('.font-hex').value = sw.dataset.color;
+    });
+  });
+
+  // Font hex input
+  const fontHex = popup.querySelector('.font-hex');
+  const fontApply = popup.querySelector('.font-apply-btn');
+  fontApply.addEventListener('click', () => {
+    let hex = fontHex.value.trim();
     if (!hex.startsWith('#')) hex = '#' + hex;
     if (/^#[0-9a-fA-F]{6}$/.test(hex)) {
       applyFontColor(hex);
-      popup.querySelectorAll('.color-swatch').forEach(s => s.classList.toggle('active', s.dataset.color === hex));
+      popup.querySelectorAll('.font-swatch').forEach(s => s.classList.toggle('active', s.dataset.color === hex));
     }
   });
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyBtn.click(); });
+  fontHex.addEventListener('keydown', (e) => { if (e.key === 'Enter') fontApply.click(); });
 
   // Font size slider
   const slider = popup.querySelector('.font-size-slider');
@@ -411,89 +548,54 @@ function toggleColorPicker() {
     applyFontSize(val);
   });
 
+  // ── Money config ──
+  const rateApply = popup.querySelector('.rate-apply');
+  if (rateApply) {
+    const rateInput = popup.querySelector('.rate-input');
+    rateApply.addEventListener('click', () => {
+      const val = parseFloat(rateInput.value);
+      if (val > 0) { COST_PER_SESSION = val; localStorage.setItem('costPerSession', val); }
+    });
+    rateInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') rateApply.click(); });
+  }
+
+  const startApply = popup.querySelector('.start-apply');
+  if (startApply) {
+    const startInput = popup.querySelector('.start-input');
+    startApply.addEventListener('click', () => {
+      const val = parseFloat(startInput.value);
+      if (!isNaN(val) && val >= 0) {
+        totalMoney = val; targetMoney = val; displayedMoney = val;
+        localStorage.setItem('totalMoney', val.toFixed(4));
+        if (moneyMode) renderMoneyDisplay();
+      }
+    });
+    startInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') startApply.click(); });
+  }
+
+  const resetBtn = popup.querySelector('#settingsResetMoney');
+  if (resetBtn) resetBtn.addEventListener('click', () => { settingsPopup.remove(); settingsPopup = null; showResetConfirm(); });
+
+  // ── Actions ──
+  popup.querySelector('#settingsFullscreen').addEventListener('click', () => window.electronAPI.toggleFullscreen());
+  popup.querySelector('#settingsLogout').addEventListener('click', async () => {
+    await window.electronAPI.deleteCredentials();
+    credentials = { sessionKey: null, organizationId: null };
+    stopAutoRefresh();
+    if (countdownInterval) clearInterval(countdownInterval);
+    showScreen('login');
+    settingsPopup.remove(); settingsPopup = null;
+  });
+
   // Close on click outside
   const closeHandler = (e) => {
-    if (!popup.contains(e.target) && e.target !== dom.colorBtn) {
-      popup.remove();
-      colorPopup = null;
+    if (!popup.contains(e.target) && e.target !== dom.settingsBtn) {
+      popup.remove(); settingsPopup = null;
       document.removeEventListener('click', closeHandler);
     }
   };
   setTimeout(() => document.addEventListener('click', closeHandler), 0);
 }
-
-// ═══════════════════════════════════════════════
-// Rate Config Popup
-// ═══════════════════════════════════════════════
-
-let ratePopup = null;
-
-function toggleRatePopup() {
-  if (ratePopup) { ratePopup.remove(); ratePopup = null; return; }
-
-  const popup = document.createElement('div');
-  popup.className = 'color-popup';
-  popup.innerHTML = `
-    <div class="color-popup-title">Cost per 100% Session ($)</div>
-    <div class="color-hex-row">
-      <input type="number" class="color-hex-input rate-input" value="${COST_PER_SESSION}" min="1" step="50" style="width:120px;" />
-      <button class="color-apply-btn" id="rateApply">Apply</button>
-    </div>
-    <div style="margin-top:6px;font-size:11px;color:rgba(255,255,255,0.2);">
-      Default: $${DEFAULT_COST_PER_SESSION.toLocaleString()}
-    </div>
-
-    <div class="color-popup-title" style="margin-top:16px;">Starting Amount ($)</div>
-    <div class="color-hex-row">
-      <input type="number" class="color-hex-input start-money-input" value="${totalMoney.toFixed(2)}" min="0" step="10" style="width:120px;" />
-      <button class="color-apply-btn" id="startMoneyApply">Set</button>
-    </div>
-    <div style="margin-top:6px;font-size:11px;color:rgba(255,255,255,0.2);">
-      Set current total to a specific amount.
-    </div>
-  `;
-  document.body.appendChild(popup);
-  ratePopup = popup;
-
-  const rateInput = popup.querySelector('.rate-input');
-  const rateApplyBtn = popup.querySelector('#rateApply');
-
-  rateApplyBtn.addEventListener('click', () => {
-    const val = parseFloat(rateInput.value);
-    if (val > 0) {
-      COST_PER_SESSION = val;
-      localStorage.setItem('costPerSession', val);
-    }
-  });
-  rateInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') rateApplyBtn.click(); });
-
-  const startInput = popup.querySelector('.start-money-input');
-  const startApplyBtn = popup.querySelector('#startMoneyApply');
-
-  startApplyBtn.addEventListener('click', () => {
-    const val = parseFloat(startInput.value);
-    if (!isNaN(val) && val >= 0) {
-      totalMoney = val;
-      targetMoney = val;
-      displayedMoney = val;
-      localStorage.setItem('totalMoney', val.toFixed(4));
-      if (moneyMode) renderMoneyDisplay();
-    }
-  });
-  startInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') startApplyBtn.click(); });
-
-  const rateBtn = document.getElementById('rateBtn');
-  const closeHandler = (e) => {
-    if (!popup.contains(e.target) && e.target !== rateBtn) {
-      popup.remove();
-      ratePopup = null;
-      document.removeEventListener('click', closeHandler);
-    }
-  };
-  setTimeout(() => document.addEventListener('click', closeHandler), 0);
-}
-
-document.getElementById('rateBtn').addEventListener('click', toggleRatePopup);
 
 // ═══════════════════════════════════════════════
 // Money Mode
@@ -502,13 +604,11 @@ document.getElementById('rateBtn').addEventListener('click', toggleRatePopup);
 function applyMoneyMode() {
   if (moneyMode) {
     dom.sessionBarWrap.style.display = 'none';
-    dom.resetMoneyBtn.style.display = '';
     dom.usageLabel.textContent = 'TOTAL SPENT';
     renderMoneyDisplay();
     startMoneyTick();
   } else {
     dom.sessionBarWrap.style.display = '';
-    dom.resetMoneyBtn.style.display = 'none';
     dom.usageLabel.textContent = 'CURRENT SESSION';
     stopMoneyTick();
     if (usageData) updateSessionUI();
@@ -874,6 +974,362 @@ function updateCountdowns() {
 function startCountdown() {
   if (countdownInterval) clearInterval(countdownInterval);
   countdownInterval = setInterval(updateCountdowns, 1000);
+}
+
+// ═══════════════════════════════════════════════
+// Music Visualization
+// ═══════════════════════════════════════════════
+
+// Toggle music on/off
+function toggleMusic() {
+  musicEnabled = !musicEnabled;
+  localStorage.setItem('musicEnabled', musicEnabled);
+
+  if (musicEnabled) {
+    startMediaPolling();
+    startAudioCapture();
+  } else {
+    stopMediaPolling();
+    stopAudioCapture();
+    hideNowPlaying();
+    bassLevel = 0;
+    bassSmooth = 0;
+    peakBass = 0;
+    themeColor = null;
+    shakeY = 0;
+    dom.sessionPct.style.color = fontColor;
+    dom.sessionPct.style.textShadow = '';
+  }
+}
+
+// ── Media Polling (SMTC) ──
+
+function startMediaPolling() {
+  pollMediaInfo();
+  mediaPollingInterval = setInterval(pollMediaInfo, 2500);
+}
+
+function stopMediaPolling() {
+  if (mediaPollingInterval) {
+    clearInterval(mediaPollingInterval);
+    mediaPollingInterval = null;
+  }
+}
+
+async function pollMediaInfo() {
+  try {
+    const info = await window.electronAPI.getMediaInfo();
+
+    if (!info || info.status === 'None' || info.status === 'Error') {
+      if (currentMedia) {
+        currentMedia = null;
+        hideNowPlaying();
+        themeColor = null;
+        dom.sessionPct.style.color = fontColor;
+        dom.sessionPct.style.textShadow = '';
+      }
+      return;
+    }
+
+    const mediaKey = `${info.title}|${info.artist}`;
+    const songChanged = mediaKey !== lastMediaKey;
+    lastMediaKey = mediaKey;
+    currentMedia = info;
+
+    showNowPlaying(info, songChanged);
+
+    if (songChanged && info.thumb) {
+      extractThemeColor(info.thumb, info.thumbType);
+    }
+  } catch (e) {
+    // Silently fail - music detection is optional
+  }
+}
+
+function showNowPlaying(info, songChanged) {
+  dom.musicWidget.classList.add('visible');
+  dom.musicWidget.classList.toggle('paused', info.status !== 'Playing');
+
+  if (songChanged) {
+    dom.musicTitle.textContent = info.title || 'Unknown';
+    dom.musicArtist.textContent = info.artist || 'Unknown Artist';
+  }
+
+  const placeholder = document.getElementById('musicArtPlaceholder');
+
+  if (songChanged || (info.thumb && dom.musicArt.style.display !== 'block')) {
+    if (info.thumb) {
+      const mimeType = info.thumbType || 'image/jpeg';
+      dom.musicArt.src = `data:${mimeType};base64,${info.thumb}`;
+      dom.musicArt.style.display = 'block';
+      placeholder.style.display = 'none';
+    } else {
+      dom.musicArt.style.display = 'none';
+      placeholder.style.display = 'flex';
+      // Try fetching art from web if SMTC didn't provide it
+      if (songChanged && info.title) {
+        fetchAlbumArt(info.title, info.artist);
+      }
+    }
+  }
+
+  // Apply theme color to widget border
+  if (themeColor && info.status === 'Playing') {
+    const { r, g, b } = themeColor;
+    dom.musicWidget.style.borderColor = `rgba(${r}, ${g}, ${b}, 0.2)`;
+    dom.musicWidget.style.boxShadow = `0 0 20px rgba(${r}, ${g}, ${b}, 0.06)`;
+    dom.musicTitle.style.color = `rgb(${r}, ${g}, ${b})`;
+  }
+}
+
+function hideNowPlaying() {
+  dom.musicWidget.classList.remove('visible');
+  dom.musicWidget.style.borderColor = '';
+  dom.musicWidget.style.boxShadow = '';
+  dom.musicTitle.style.color = '';
+  lastMediaKey = '';
+  currentMedia = null;
+}
+
+// ── Album Art Fallback (web fetch) ──
+
+let artFetchCache = {}; // cache by "title|artist"
+
+async function fetchAlbumArt(title, artist) {
+  const key = `${title}|${artist}`;
+  if (artFetchCache[key] !== undefined) {
+    if (artFetchCache[key]) applyFetchedArt(artFetchCache[key]);
+    return;
+  }
+  try {
+    const result = await window.electronAPI.fetchAlbumArt(title, artist);
+    if (result && result.url) {
+      artFetchCache[key] = result.url;
+      // Only apply if still the same song
+      if (lastMediaKey === key) applyFetchedArt(result.url);
+    } else {
+      artFetchCache[key] = null;
+    }
+  } catch {
+    artFetchCache[key] = null;
+  }
+}
+
+function applyFetchedArt(url) {
+  const placeholder = document.getElementById('musicArtPlaceholder');
+  dom.musicArt.src = url;
+  dom.musicArt.style.display = 'block';
+  placeholder.style.display = 'none';
+
+  // Extract theme color from the fetched image
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    const c = document.createElement('canvas');
+    const ctx2 = c.getContext('2d');
+    c.width = 10; c.height = 10;
+    ctx2.drawImage(img, 0, 0, 10, 10);
+    try {
+      const pixels = ctx2.getImageData(0, 0, 10, 10).data;
+      extractThemeColorFromPixels(pixels);
+    } catch {}
+  };
+  img.src = url;
+}
+
+// ── Audio Capture (System Audio → Bass Detection) ──
+
+async function startAudioCapture() {
+  if (audioCaptureActive) return;
+  try {
+    audioStream = await navigator.mediaDevices.getDisplayMedia({
+      audio: true,
+      video: { width: 1, height: 1 }
+    });
+
+    // Stop video track immediately - we only need audio
+    audioStream.getVideoTracks().forEach(t => t.stop());
+
+    const audioTrack = audioStream.getAudioTracks()[0];
+    if (!audioTrack) return;
+
+    audioCtx = new AudioContext();
+    const source = audioCtx.createMediaStreamSource(new MediaStream([audioTrack]));
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.15; // Low smoothing = sharper transients
+    source.connect(analyser);
+    bassFreqData = new Uint8Array(analyser.frequencyBinCount);
+    audioCaptureActive = true;
+
+    // Handle track ending (user revokes permission)
+    audioTrack.addEventListener('ended', () => {
+      audioCaptureActive = false;
+      analyser = null;
+    });
+  } catch (e) {
+    // Audio capture failed - music info still works, just no bass effects
+    audioCaptureActive = false;
+  }
+}
+
+function stopAudioCapture() {
+  if (audioStream) {
+    audioStream.getTracks().forEach(t => t.stop());
+    audioStream = null;
+  }
+  if (audioCtx) {
+    audioCtx.close().catch(() => {});
+    audioCtx = null;
+    analyser = null;
+  }
+  audioCaptureActive = false;
+  bassFreqData = null;
+}
+
+// ── Bass Analysis (called every frame from animateStarfield) ──
+
+function updateBassLevel() {
+  if (!analyser || !musicEnabled || !bassFreqData) {
+    bassLevel *= 0.9;
+    bassSmooth *= 0.88;
+    bassHit *= 0.85;
+    peakBass *= 0.95;
+    bassAvg *= 0.99;
+    return;
+  }
+
+  analyser.getByteFrequencyData(bassFreqData);
+
+  // Sub-bass (bins 0-1, ~0-375Hz) and bass (bins 2-4, ~375-940Hz)
+  let subBass = 0;
+  let bass = 0;
+  for (let i = 0; i < 2; i++) subBass += bassFreqData[i];
+  for (let i = 0; i < 5; i++) bass += bassFreqData[i];
+  subBass /= (2 * 255);
+  bass /= (5 * 255);
+
+  const rawBass = Math.min(1, subBass * 0.65 + bass * 0.35);
+
+  // Running average - tracks the "floor" level
+  bassAvg = bassAvg * 0.97 + rawBass * 0.03;
+
+  // Transient = how much above average (this is what you "feel")
+  const transient = Math.max(0, rawBass - bassAvg * 0.85);
+
+  // bassHit: sharp impulse that decays fast - each beat is distinct
+  if (transient > bassHit) {
+    bassHit = transient; // instant attack
+  } else {
+    bassHit *= 0.82; // fast decay - drops between beats
+  }
+
+  bassLevel = rawBass;
+
+  // bassSmooth drives stars & glow - use transient, not absolute
+  // This way constant bass = calm, beat hits = pulse
+  bassSmooth = bassHit * 2.5;
+  bassSmooth = Math.min(1, bassSmooth);
+
+  // Peak detection for screen shake kicks
+  if (transient > peakBass * 1.2 && transient > 0.08) {
+    peakBass = transient;
+    onBassKick(transient * 2);
+  }
+  peakBass *= 0.9;
+}
+
+// ── Screen Shake on Bass Kicks ──
+
+function onBassKick(intensity) {
+  // Scale shake with screen size for bigger impact on large displays
+  const screenScale = Math.max(1, Math.min(2, canvas.height / 800));
+  const force = Math.min(14 * screenScale, intensity * 22 * screenScale);
+  shakeY = -force;
+  shakeVelocity = force * 0.6;
+}
+
+function updateScreenShake() {
+  if (Math.abs(shakeY) < 0.1 && Math.abs(shakeVelocity) < 0.1) {
+    if (shakeY !== 0) {
+      shakeY = 0;
+      canvas.style.transform = '';
+    }
+    return;
+  }
+
+  // Spring physics: bounce back to 0
+  const stiffness = 0.35;
+  const damping = 0.65;
+  shakeVelocity += (-shakeY * stiffness);
+  shakeVelocity *= damping;
+  shakeY += shakeVelocity;
+
+  canvas.style.transform = `translateY(${shakeY.toFixed(1)}px)`;
+}
+
+// ── Theme Color Extraction from Album Art ──
+
+function extractThemeColor(base64, mimeType) {
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement('canvas');
+    const ctx2 = c.getContext('2d');
+    c.width = 10; c.height = 10;
+    ctx2.drawImage(img, 0, 0, 10, 10);
+    const pixels = ctx2.getImageData(0, 0, 10, 10).data;
+    extractThemeColorFromPixels(pixels);
+  };
+  img.src = `data:${mimeType || 'image/jpeg'};base64,${base64}`;
+}
+
+function extractThemeColorFromPixels(pixels) {
+  let bestColor = null;
+  let bestScore = 0;
+
+  for (let i = 0; i < pixels.length; i += 4) {
+    const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const saturation = max > 0 ? (max - min) / max : 0;
+    const brightness = max / 255;
+    const score = saturation * 2.5 + brightness * 0.4 - Math.abs(brightness - 0.6) * 0.5;
+    if (brightness > 0.12 && brightness < 0.95 && score > bestScore) {
+      bestScore = score;
+      bestColor = { r, g, b };
+    }
+  }
+
+  if (!bestColor || bestScore < 0.25) {
+    themeColor = { r: 180, g: 200, b: 255 };
+  } else {
+    const { r, g, b } = bestColor;
+    const maxC = Math.max(r, g, b, 1);
+    const boost = Math.min(2.2, 220 / maxC);
+    themeColor = {
+      r: Math.min(255, Math.round(r * boost)),
+      g: Math.min(255, Math.round(g * boost)),
+      b: Math.min(255, Math.round(b * boost))
+    };
+  }
+  applyThemeColor();
+}
+
+function applyThemeColor() {
+  if (!musicEnabled || !themeColor || !currentMedia || currentMedia.status !== 'Playing') {
+    dom.sessionPct.style.color = fontColor;
+    dom.sessionPct.style.textShadow = '';
+    return;
+  }
+
+  const { r, g, b } = themeColor;
+  dom.sessionPct.style.color = `rgb(${r}, ${g}, ${b})`;
+  dom.sessionPct.style.textShadow = `0 0 80px rgba(${r}, ${g}, ${b}, 0.15), 0 0 160px rgba(${r}, ${g}, ${b}, 0.06)`;
+
+  // Also tint the music widget
+  dom.musicWidget.style.borderColor = `rgba(${r}, ${g}, ${b}, 0.2)`;
+  dom.musicWidget.style.boxShadow = `0 0 20px rgba(${r}, ${g}, ${b}, 0.06)`;
+  dom.musicTitle.style.color = `rgb(${r}, ${g}, ${b})`;
 }
 
 // ═══════════════════════════════════════════════
