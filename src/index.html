@@ -11,6 +11,7 @@
 </head>
 <body>
   <canvas id="starfield"></canvas>
+  <canvas id="planetCanvas" style="position:fixed;inset:0;z-index:1;display:none;pointer-events:none;opacity:0;"></canvas>
 
   <!-- Red corner pulse when out of usage -->
   <div id="cornerPulse" style="display:none;">
@@ -155,6 +156,16 @@
     <div class="loading-text">Initializing</div>
   </div>
 
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../node_modules/three/build/three.module.min.js",
+        "three/examples/jsm/": "../node_modules/three/examples/jsm/",
+        "three/addons/": "../node_modules/three/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="planet.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

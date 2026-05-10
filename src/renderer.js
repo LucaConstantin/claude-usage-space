@@ -15,12 +15,30 @@ let bassSmooth = 0;
 let bassLevel = 0;
 let peakBass = 0;
 let themeColor = null; // { r, g, b } from album art
+// Expose themeColor globally so planet.js can read it
+Object.defineProperty(window, 'themeColor', { get: () => themeColor });
 let shakeY = 0;
 let shakeVelocity = 0;
 let bassAvg = 0;
 let bassHit = 0;
 let glowColor = localStorage.getItem('glowColor') || 'auto';
 let bassGlowEnabled = localStorage.getItem('bassGlowEnabled') !== 'false';
+
+// ── Comet system ──
+let comets = [];
+const MAX_COMETS = 2;
+
+// ── Shockwave system ──
+let shockwaves = [];
+
+// ── Gravitational collapse state ──
+let gravityPull = 0; // 0 = none, 1 = full black hole
+let usagePct = 0; // current usage percentage for gravity effect
+
+// ── Screen crack state ──
+let cracks = [];
+let cracksGenerated = false;
+let crackAlpha = 0;
 
 // Music state (must be before animateStarfield runs)
 let currentMedia = null;
@@ -54,6 +72,16 @@ const songAnalysis = {
   lastBeatTime: 0,
   beatInterval: 0,          // ms between beats (from BPM)
 
+  // Spectral flux for smarter onset detection
+  prevSpectrum: null,       // previous frame's frequency data
+  spectralFlux: 0,          // how much the spectrum changed this frame
+  fluxHistory: [],          // rolling flux values for adaptive threshold
+  fluxHistoryMax: 90,       // ~1.5 seconds
+
+  // Beat prediction
+  nextBeatTime: 0,          // predicted time of next beat
+  beatPhase: 0,             // 0-1 where we are in the current beat cycle
+
   // Adaptive scaling
   effectIntensity: 0,       // 0-1, how intense effects should be right now
   smoothIntensity: 0,       // smoothed version for rendering
@@ -71,6 +99,11 @@ const songAnalysis = {
     this.beatTimes = [];
     this.lastBeatTime = 0;
     this.beatInterval = 0;
+    this.prevSpectrum = null;
+    this.spectralFlux = 0;
+    this.fluxHistory = [];
+    this.nextBeatTime = 0;
+    this.beatPhase = 0;
     this.effectIntensity = 0;
     this.smoothIntensity = 0;
     this.volumeNormFactor = 1;
@@ -183,8 +216,8 @@ function drawStars() {
 
   // Bass corner glow - colored pulse from corners on heavy bass
   // Glow is modulated by song intelligence - gentler during intros
-  if (bassGlowEnabled && bassSmooth > 0.06) {
-    const bAlpha = bassSmooth * 0.22 * (0.5 + songAnalysis.smoothIntensity * 0.5);
+  if (bassGlowEnabled && bassSmooth > 0.03) {
+    const bAlpha = bassSmooth * 0.18;
     const gc = getGlowRGB();
     const w = canvas.width, h = canvas.height;
     const cornerRadius = Math.max(w, h) * 0.5;
@@ -200,11 +233,236 @@ function drawStars() {
   }
 }
 
+// ── Comet System ──
+
+function spawnComet() {
+  if (comets.length >= MAX_COMETS) return;
+  const gc = getGlowRGB();
+  const side = Math.random();
+  let x, y, vx, vy;
+  const speed = 4 + Math.random() * 6;
+  if (side < 0.25) { // from left
+    x = -10; y = Math.random() * canvas.height;
+    vx = speed; vy = (Math.random() - 0.5) * speed * 0.5;
+  } else if (side < 0.5) { // from right
+    x = canvas.width + 10; y = Math.random() * canvas.height;
+    vx = -speed; vy = (Math.random() - 0.5) * speed * 0.5;
+  } else if (side < 0.75) { // from top
+    x = Math.random() * canvas.width; y = -10;
+    vx = (Math.random() - 0.5) * speed * 0.5; vy = speed;
+  } else { // from bottom
+    x = Math.random() * canvas.width; y = canvas.height + 10;
+    vx = (Math.random() - 0.5) * speed * 0.5; vy = -speed;
+  }
+  comets.push({
+    x, y, vx, vy,
+    trail: [],
+    life: 1,
+    r: gc.r, g: gc.g, b: gc.b,
+    size: 2 + Math.random() * 2
+  });
+}
+
+function updateAndDrawComets() {
+  for (let i = comets.length - 1; i >= 0; i--) {
+    const c = comets[i];
+    c.trail.push({ x: c.x, y: c.y });
+    if (c.trail.length > 35) c.trail.shift();
+    c.x += c.vx;
+    c.y += c.vy;
+    c.life -= 0.008;
+
+    // Draw trail
+    for (let j = 0; j < c.trail.length; j++) {
+      const t = j / c.trail.length;
+      const alpha = t * c.life * 0.6;
+      const sz = c.size * t;
+      ctx.beginPath();
+      ctx.arc(c.trail[j].x, c.trail[j].y, sz, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${c.r}, ${c.g}, ${c.b}, ${alpha})`;
+      ctx.fill();
+    }
+    // Draw head
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, c.size * 1.5, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255, 255, 255, ${c.life * 0.9})`;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, c.size * 4, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${c.r}, ${c.g}, ${c.b}, ${c.life * 0.15})`;
+    ctx.fill();
+
+    if (c.life <= 0 || c.x < -100 || c.x > canvas.width + 100 || c.y < -100 || c.y > canvas.height + 100) {
+      comets.splice(i, 1);
+    }
+  }
+}
+
+// ── Shockwave System ──
+
+function emitShockwave() {
+  // Emit from music widget position (top-left)
+  const widgetRect = dom.musicWidget.getBoundingClientRect();
+  shockwaves.push({
+    x: widgetRect.left + widgetRect.width / 2,
+    y: widgetRect.top + widgetRect.height / 2,
+    radius: 0,
+    maxRadius: Math.max(canvas.width, canvas.height) * 1.2,
+    speed: 8,
+    life: 1
+  });
+}
+
+function updateAndDrawShockwaves() {
+  const gc = getGlowRGB();
+  for (let i = shockwaves.length - 1; i >= 0; i--) {
+    const sw = shockwaves[i];
+    sw.radius += sw.speed;
+    sw.speed *= 1.02; // accelerate
+    sw.life = 1 - (sw.radius / sw.maxRadius);
+
+    if (sw.life <= 0) { shockwaves.splice(i, 1); continue; }
+
+    const alpha = sw.life * 0.25;
+    const width = 2 + sw.life * 3;
+    ctx.beginPath();
+    ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(${gc.r}, ${gc.g}, ${gc.b}, ${alpha})`;
+    ctx.lineWidth = width;
+    ctx.stroke();
+
+    // Inner glow ring
+    ctx.beginPath();
+    ctx.arc(sw.x, sw.y, sw.radius, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(255, 255, 255, ${alpha * 0.4})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+}
+
+// Push stars outward when shockwave passes them
+function applyShockwaveToStars() {
+  for (const sw of shockwaves) {
+    if (sw.life <= 0) continue;
+    for (const s of stars) {
+      const sx = (s.x / s.z) * 500 + centerX;
+      const sy = (s.y / s.z) * 500 + centerY;
+      const dx = sx - sw.x;
+      const dy = sy - sw.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      // Push stars in a ring around the shockwave front
+      if (Math.abs(dist - sw.radius) < 40) {
+        const push = sw.life * 15;
+        s.z -= push; // push stars forward (closer to camera)
+      }
+    }
+  }
+}
+
+// ── Gravitational Collapse ──
+
+function updateGravity() {
+  // Smooth transition to target gravity
+  const targetGravity = usagePct >= 90 ? Math.min(1, (usagePct - 90) / 10) : 0;
+  gravityPull += (targetGravity - gravityPull) * 0.02;
+}
+
+function applyGravityToStars() {
+  if (gravityPull < 0.01) return;
+  for (const s of stars) {
+    const sx = (s.x / s.z) * 500;
+    const sy = (s.y / s.z) * 500;
+    const dist = Math.sqrt(sx * sx + sy * sy);
+    if (dist > 10) {
+      const pull = gravityPull * 0.15 * (500 / (dist + 100));
+      s.x -= (sx / dist) * pull * s.z * 0.002;
+      s.y -= (sy / dist) * pull * s.z * 0.002;
+    }
+  }
+}
+
+// ── Screen Cracks at 95%+ ──
+
+function generateCracks() {
+  cracks = [];
+  const numCracks = 5 + Math.floor(Math.random() * 4);
+  for (let i = 0; i < numCracks; i++) {
+    const crack = [];
+    // Start from center area
+    let x = centerX + (Math.random() - 0.5) * 100;
+    let y = centerY + (Math.random() - 0.5) * 100;
+    const angle = Math.random() * Math.PI * 2;
+    const length = 8 + Math.floor(Math.random() * 12);
+    let dir = angle;
+    for (let j = 0; j < length; j++) {
+      crack.push({ x, y });
+      const step = 15 + Math.random() * 30;
+      dir += (Math.random() - 0.5) * 0.8;
+      x += Math.cos(dir) * step;
+      y += Math.sin(dir) * step;
+      // Branch occasionally
+      if (Math.random() < 0.2 && j > 2) {
+        const branch = [];
+        let bx = x, by = y;
+        let bdir = dir + (Math.random() - 0.5) * 1.5;
+        const blen = 3 + Math.floor(Math.random() * 5);
+        for (let k = 0; k < blen; k++) {
+          branch.push({ x: bx, y: by });
+          bdir += (Math.random() - 0.5) * 0.6;
+          bx += Math.cos(bdir) * (10 + Math.random() * 20);
+          by += Math.sin(bdir) * (10 + Math.random() * 20);
+        }
+        cracks.push(branch);
+      }
+    }
+    cracks.push(crack);
+  }
+  cracksGenerated = true;
+}
+
+function drawCracks() {
+  const targetAlpha = usagePct >= 95 ? Math.min(1, (usagePct - 95) / 5) : 0;
+  crackAlpha += (targetAlpha - crackAlpha) * 0.03;
+
+  if (crackAlpha < 0.01) { cracksGenerated = false; return; }
+  if (!cracksGenerated) generateCracks();
+
+  const pulse = 0.6 + Math.sin(Date.now() * 0.003) * 0.4;
+
+  for (const crack of cracks) {
+    if (crack.length < 2) continue;
+    // Glowing crack line
+    ctx.beginPath();
+    ctx.moveTo(crack[0].x, crack[0].y);
+    for (let i = 1; i < crack.length; i++) {
+      ctx.lineTo(crack[i].x, crack[i].y);
+    }
+    // Hot white core
+    ctx.strokeStyle = `rgba(255, 200, 150, ${crackAlpha * pulse * 0.8})`;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    // Orange glow
+    ctx.strokeStyle = `rgba(255, 100, 30, ${crackAlpha * pulse * 0.5})`;
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    // Wide red glow
+    ctx.strokeStyle = `rgba(220, 40, 40, ${crackAlpha * pulse * 0.15})`;
+    ctx.lineWidth = 12;
+    ctx.stroke();
+  }
+}
+
 function animateStarfield() {
   updateBassLevel();
   updateScreenShake();
+  updateGravity();
+  applyGravityToStars();
+  applyShockwaveToStars();
   updateStars();
   drawStars();
+  updateAndDrawComets();
+  updateAndDrawShockwaves();
+  drawCracks();
   requestAnimationFrame(animateStarfield);
 }
 
@@ -299,6 +557,7 @@ function showScreen(name) {
 
 async function init() {
   setupEvents();
+  // Planet scene inits itself via module - no need to call here
   credentials = await window.electronAPI.getCredentials();
 
   // Restore saved toggle states
@@ -442,7 +701,14 @@ setTimeout(() => {
 let settingsPopup = null;
 
 function toggleSettings() {
-  if (settingsPopup) { settingsPopup.remove(); settingsPopup = null; return; }
+  if (settingsPopup) {
+    settingsPopup.remove(); settingsPopup = null;
+    if (window.PlanetScene) PlanetScene.hide();
+    return;
+  }
+
+  // Show exploding planet when opening settings
+  if (window.PlanetScene) PlanetScene.show();
 
   const presets = ['#ffffff', '#f87171', '#fbbf24', '#34d399', '#60a5fa', '#a78bfa', '#f472b6', '#fb923c'];
   const glowPresets = ['#f87171', '#fbbf24', '#34d399', '#60a5fa', '#a78bfa', '#f472b6', '#fb923c'];
@@ -637,6 +903,7 @@ function toggleSettings() {
   const closeHandler = (e) => {
     if (!popup.contains(e.target) && e.target !== dom.settingsBtn) {
       popup.remove(); settingsPopup = null;
+      if (window.PlanetScene) PlanetScene.hide();
       document.removeEventListener('click', closeHandler);
     }
   };
@@ -941,7 +1208,9 @@ function updateSessionUI() {
 }
 
 function updateCornerPulse(pct) {
-  dom.cornerPulse.style.display = pct >= 95 ? 'block' : 'none';
+  usagePct = pct;
+  // Hide old corner pulse - replaced by cracks system
+  dom.cornerPulse.style.display = 'none';
 }
 
 function updateWeeklyUI() {
@@ -1085,6 +1354,7 @@ async function pollMediaInfo() {
     // Reset song analysis on song change - fresh analysis for new track
     if (songChanged) {
       songAnalysis.reset();
+      emitShockwave();
     }
 
     showNowPlaying(info, songChanged);
@@ -1303,45 +1573,84 @@ function updateBassLevel() {
     introRamp = 0.3 + t * 0.7; // starts at 30% intensity, ramps to full
   }
 
-  // ── BPM detection via beat onset tracking ──
+  // ── Spectral flux onset detection (smarter than pure bass threshold) ──
+  // Compare current spectrum to previous frame - detects ALL onsets, not just bass
+  let flux = 0;
+  const currentSpectrum = new Float32Array(bassFreqData.length);
+  for (let i = 0; i < bassFreqData.length; i++) {
+    currentSpectrum[i] = bassFreqData[i] / 255;
+    if (songAnalysis.prevSpectrum) {
+      const diff = currentSpectrum[i] - songAnalysis.prevSpectrum[i];
+      if (diff > 0) flux += diff; // only positive flux (onset, not offset)
+    }
+  }
+  songAnalysis.prevSpectrum = currentSpectrum;
+  songAnalysis.spectralFlux = flux;
+
+  // Adaptive flux threshold from recent history
+  songAnalysis.fluxHistory.push(flux);
+  if (songAnalysis.fluxHistory.length > songAnalysis.fluxHistoryMax) songAnalysis.fluxHistory.shift();
+  let fluxMedian = 0;
+  if (songAnalysis.fluxHistory.length > 10) {
+    const sorted = [...songAnalysis.fluxHistory].sort((a, b) => a - b);
+    fluxMedian = sorted[Math.floor(sorted.length * 0.7)]; // 70th percentile as threshold
+  }
+
   const normalizedBass = Math.min(1, rawBass * songAnalysis.volumeNormFactor);
 
-  // Running average with normalization awareness
+  // Running average
   bassAvg = bassAvg * 0.97 + normalizedBass * 0.03;
 
-  // Transient detection - how far above the running average
+  // Combined onset: spectral flux AND bass transient for musical accuracy
   const transient = Math.max(0, normalizedBass - bassAvg * 0.85);
+  const isFluxOnset = flux > fluxMedian * 1.4 && flux > 0.5;
+  const isBassOnset = transient > 0.08;
 
-  // Beat onset detection for BPM
+  // Beat onset: either strong bass transient or significant spectral change
   const now = performance.now();
-  const minBeatGap = 200; // max 300 BPM
-  if (transient > 0.08 && (now - songAnalysis.lastBeatTime) > minBeatGap) {
+  const minBeatGap = 180; // max ~330 BPM
+  const beatDetected = (isBassOnset || isFluxOnset) && (now - songAnalysis.lastBeatTime) > minBeatGap;
+
+  if (beatDetected) {
     songAnalysis.beatTimes.push(now);
     songAnalysis.lastBeatTime = now;
 
-    // Keep last 16 beats for BPM calculation
-    if (songAnalysis.beatTimes.length > 16) songAnalysis.beatTimes.shift();
+    if (songAnalysis.beatTimes.length > 20) songAnalysis.beatTimes.shift();
 
-    // Calculate BPM from beat intervals
+    // BPM from beat intervals - cluster-based for accuracy
     if (songAnalysis.beatTimes.length >= 4) {
       const intervals = [];
       for (let i = 1; i < songAnalysis.beatTimes.length; i++) {
         intervals.push(songAnalysis.beatTimes[i] - songAnalysis.beatTimes[i - 1]);
       }
-      // Sort and take median interval (robust to outliers)
       intervals.sort((a, b) => a - b);
-      const medianInterval = intervals[Math.floor(intervals.length / 2)];
 
-      if (medianInterval > 0) {
-        const detectedBPM = 60000 / medianInterval;
-        // Only accept reasonable BPM range (60-200)
+      // Use interquartile mean (remove outliers)
+      const q1 = Math.floor(intervals.length * 0.25);
+      const q3 = Math.floor(intervals.length * 0.75);
+      let iqSum = 0, iqCount = 0;
+      for (let i = q1; i <= q3; i++) {
+        iqSum += intervals[i]; iqCount++;
+      }
+      const meanInterval = iqCount > 0 ? iqSum / iqCount : intervals[Math.floor(intervals.length / 2)];
+
+      if (meanInterval > 0) {
+        const detectedBPM = 60000 / meanInterval;
         if (detectedBPM >= 60 && detectedBPM <= 200) {
           songAnalysis.bpm = songAnalysis.bpm * 0.7 + detectedBPM * 0.3;
           songAnalysis.beatInterval = 60000 / songAnalysis.bpm;
-          songAnalysis.bpmConfidence = Math.min(1, songAnalysis.beatTimes.length / 8);
+          songAnalysis.bpmConfidence = Math.min(1, songAnalysis.beatTimes.length / 10);
+          // Predict next beat
+          songAnalysis.nextBeatTime = now + songAnalysis.beatInterval;
         }
       }
     }
+  }
+
+  // ── Beat phase (0-1 cycle synced to BPM) ──
+  if (songAnalysis.beatInterval > 0 && songAnalysis.bpmConfidence > 0.3) {
+    const timeSinceLastBeat = now - songAnalysis.lastBeatTime;
+    songAnalysis.beatPhase = (timeSinceLastBeat % songAnalysis.beatInterval) / songAnalysis.beatInterval;
   }
 
   // ── Adaptive effect intensity ──
@@ -1364,23 +1673,21 @@ function updateBassLevel() {
   // ── Apply to bass-reactive state (what the visuals use) ──
   bassLevel = normalizedBass;
 
-  // bassHit: sharp impulse, scaled by song intelligence
+  // bassHit: sharp impulse that decays fast - each beat is distinct
   if (transient > bassHit) {
-    bassHit = transient * (0.5 + songAnalysis.smoothIntensity * 0.5);
+    bassHit = transient; // instant attack
   } else {
-    bassHit *= 0.82;
+    bassHit *= 0.82; // fast decay
   }
 
-  // bassSmooth: drives stars & glow, modulated by adaptive intensity
-  bassSmooth = bassHit * 3.0 * (0.6 + songAnalysis.smoothIntensity * 0.4);
+  // bassSmooth drives stars & glow - full intensity like original
+  bassSmooth = bassHit * 2.5;
   bassSmooth = Math.min(1, bassSmooth);
 
-  // Peak detection for screen shake - gentler during intro but still punchy
-  const shakeThreshold = songAnalysis.introPhase ? 0.12 : 0.07;
-  const shakeScale = 0.5 + songAnalysis.smoothIntensity * 0.5;
-  if (transient > peakBass * 1.2 && transient > shakeThreshold) {
+  // Peak detection for screen shake kicks
+  if (transient > peakBass * 1.2 && transient > 0.08) {
     peakBass = transient;
-    onBassKick(transient * 2.5 * shakeScale);
+    onBassKick(transient * 2);
   }
   peakBass *= 0.9;
 }
@@ -1390,10 +1697,14 @@ function updateBassLevel() {
 function onBassKick(intensity) {
   // Scale shake with screen size for bigger impact on large displays
   const screenScale = Math.max(1, Math.min(2, canvas.height / 800));
-  const maxForce = 12 * screenScale;
-  const force = Math.min(maxForce, intensity * 20 * screenScale);
+  const force = Math.min(14 * screenScale, intensity * 22 * screenScale);
   shakeY = -force;
-  shakeVelocity = force * 0.55;
+  shakeVelocity = force * 0.6;
+
+  // Spawn comet rarely on very strong kicks
+  if (intensity > 0.6 && musicEnabled && Math.random() < 0.25) {
+    spawnComet();
+  }
 }
 
 function updateScreenShake() {

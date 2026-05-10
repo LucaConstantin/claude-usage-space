@@ -15,13 +15,17 @@
     "electron-builder": "^24.9.1"
   },
   "dependencies": {
-    "electron-store": "^8.1.0"
+    "electron-store": "^8.1.0",
+    "three": "^0.184.0"
   },
   "build": {
     "appId": "com.claude-usage-space.app",
     "productName": "Claude Usage Space",
     "win": {
-      "target": ["nsis", "portable"],
+      "target": [
+        "nsis",
+        "portable"
+      ],
       "icon": "assets/icon.png",
       "signingHashAlgorithms": [],
       "sign": null
