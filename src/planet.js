@@ -69,7 +69,7 @@ async function loadModel() {
   try {
     const loader = new GLTFLoader();
     const gltf = await new Promise((resolve, reject) => {
-      loader.load('../purple_planet.glb', resolve, undefined, reject);
+      loader.load('./purple_planet.glb', resolve, undefined, reject);
     });
 
     const model = gltf.scene;
@@ -96,6 +96,18 @@ async function loadModel() {
     model.position.sub(center);
     model.scale.setScalar(scale);
     planetGroup.add(model);
+
+    // Subtle atmospheric glow
+    const glowGeo = new THREE.SphereGeometry(maxDim * scale * 0.55, 32, 32);
+    const glowMat = new THREE.MeshBasicMaterial({
+      color: 0x8866cc,
+      transparent: true,
+      opacity: 0.06,
+      side: THREE.BackSide
+    });
+    const glowSphere = new THREE.Mesh(glowGeo, glowMat);
+    planetGroup.add(glowSphere);
+    window._planetGlow = glowMat;
 
     loaded = true;
   } catch (e) {
@@ -189,6 +201,12 @@ function animate() {
     clouds1Mesh.material.emissiveIntensity = 0.08;
   }
 
+  // Tint glow with music color
+  if (window._planetGlow) {
+    window._planetGlow.color.setRGB(currentTint.r * 0.7 + 0.3, currentTint.g * 0.7 + 0.3, currentTint.b * 0.7 + 0.3);
+    window._planetGlow.opacity = 0.05 + Math.sin(Date.now() * 0.002) * 0.015;
+  }
+
   // Canvas opacity
   planetCanvas.style.opacity = showProgress.toFixed(3);
 
@@ -205,14 +223,19 @@ function handleResize() {
 // ── Public API ──
 window.PlanetScene = {
   async init() {
+    console.log('[Planet] init called');
     planetCanvas = document.getElementById('planetCanvas');
-    if (!planetCanvas) return;
+    if (!planetCanvas) { console.error('[Planet] canvas not found!'); return; }
+    console.log('[Planet] canvas found, initializing scene...');
     initScene();
+    console.log('[Planet] scene ready, loading model...');
     await loadModel();
+    console.log('[Planet] model loaded:', loaded);
     window.addEventListener('resize', handleResize);
   },
 
   show() {
+    console.log('[Planet] show() - loaded:', loaded, 'canvas:', !!planetCanvas);
     if (!loaded || !planetCanvas) return;
     isActive = true;
     targetShow = 1;

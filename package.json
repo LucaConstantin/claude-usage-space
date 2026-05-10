@@ -44,7 +44,10 @@
       "**/*",
       "!refrence/**",
       "!*.md",
-      "!generate-icon.js"
+      "!generate-icon.js",
+      "!purple_planet.glb",
+      "!Termanation.obj",
+      "!Termanation.mtl"
     ]
   }
 }
