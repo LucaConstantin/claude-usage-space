@@ -26,7 +26,7 @@ A sleek, real-time desktop widget for monitoring your Claude AI usage. Built wit
 ### Visual Effects
 - **Deep space starfield** - 200 parallax stars with depth, streaks, and glow halos
 - **Gravitational collapse** - Stars pull toward center like a black hole at 90%+ usage
-- **Screen cracks** - Glowing lava fractures replace red corner pulse at 95%+ usage
+- **Lightning storm** - Forking, flickering lightning bolts rake across the screen with a warm screen flash, building from 95% to a near-continuous storm at 100% usage
 - **3D planet scene** - Interactive purple planet with cloud layers, shown during settings (Three.js)
 - **Planet music tinting** - Planet lights and materials shift color based on the current song
 

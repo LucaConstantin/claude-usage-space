@@ -5,10 +5,22 @@
 const canvas = document.getElementById('starfield');
 const ctx = canvas.getContext('2d');
 
+// Separate, never-shaken layer for the session-history graph
+const overlayCanvas = document.getElementById('overlayCanvas');
+const octx = overlayCanvas.getContext('2d');
+
+// Offscreen buffer holding ONLY the star layer, with a partial fade so stars
+// keep a motion-blur trail (longer on the beat). Glow effects are drawn on the
+// main canvas instead, which is cleared each frame so they never smear.
+const starBuffer = document.createElement('canvas');
+const sctx = starBuffer.getContext('2d');
+
 let stars = [];
 const STAR_COUNT = 200;
 const SPEED = 0.4;
 let centerX, centerY;
+let viewW = window.innerWidth;   // logical (CSS-pixel) canvas size
+let viewH = window.innerHeight;
 
 // Bass-reactive state (set by music system)
 let bassSmooth = 0;
@@ -23,6 +35,16 @@ let bassAvg = 0;
 let bassHit = 0;
 let glowColor = localStorage.getItem('glowColor') || 'auto';
 let bassGlowEnabled = localStorage.getItem('bassGlowEnabled') !== 'false';
+// Declared early so the animation loop (which starts synchronously below) can
+// read them without hitting the temporal dead zone.
+let fontColor = localStorage.getItem('fontColor') || '#ffffff';
+let musicEnabled = localStorage.getItem('musicEnabled') === 'true';
+
+// ── Session history: peak utilization (%) of past 5h sessions ──
+let historyEnabled = localStorage.getItem('historyEnabled') !== 'false';
+let sessionHistory = [];
+try { sessionHistory = JSON.parse(localStorage.getItem('sessionHistory') || '[]'); } catch { sessionHistory = []; }
+let sessionPeak = parseFloat(localStorage.getItem('sessionPeak')) || 0;
 
 // ── Comet system ──
 let comets = [];
@@ -31,14 +53,19 @@ const MAX_COMETS = 2;
 // ── Shockwave system ──
 let shockwaves = [];
 
+// ── Session-reset celebration ──
+let particles = [];      // burst particles
+let celebFlash = 0;      // full-screen celebration flash 0..1
+
 // ── Gravitational collapse state ──
 let gravityPull = 0; // 0 = none, 1 = full black hole
 let usagePct = 0; // current usage percentage for gravity effect
 
-// ── Screen crack state ──
-let cracks = [];
-let cracksGenerated = false;
-let crackAlpha = 0;
+// ── Lightning storm state (builds 95% → 100%) ──
+let bolts = [];          // active lightning bolts
+let crackAlpha = 0;      // overall storm intensity, ramps with usage
+let nextStrikeAt = 0;    // timestamp of next bolt spawn
+let screenFlash = 0;     // full-screen flash 0..1
 
 // Music state (must be before animateStarfield runs)
 let currentMedia = null;
@@ -111,15 +138,39 @@ const songAnalysis = {
 };
 
 function resizeCanvas() {
-  canvas.width = window.innerWidth;
-  canvas.height = window.innerHeight;
-  centerX = canvas.width / 2;
-  centerY = canvas.height / 2;
+  // Render at native device resolution for crisp lines & text on hi-DPI screens,
+  // while drawing in logical CSS pixels (context scaled by the device pixel ratio).
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  viewW = window.innerWidth;
+  viewH = window.innerHeight;
+  canvas.width = Math.round(viewW * dpr);
+  canvas.height = Math.round(viewH * dpr);
+  canvas.style.width = viewW + 'px';
+  canvas.style.height = viewH + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  // Overlay matches the starfield resolution, also drawn in logical pixels
+  overlayCanvas.width = canvas.width;
+  overlayCanvas.height = canvas.height;
+  overlayCanvas.style.width = viewW + 'px';
+  overlayCanvas.style.height = viewH + 'px';
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.imageSmoothingEnabled = true;
+  octx.imageSmoothingQuality = 'high';
+  // Star trail buffer (same resolution, logical-pixel drawing)
+  starBuffer.width = canvas.width;
+  starBuffer.height = canvas.height;
+  sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  sctx.fillStyle = '#000005';
+  sctx.fillRect(0, 0, viewW, viewH);
+  centerX = viewW / 2;
+  centerY = viewH / 2;
 }
 
 function createStar(randomDepth) {
   const angle = Math.random() * Math.PI * 2;
-  const radius = Math.random() * Math.max(canvas.width, canvas.height) * 0.9;
+  const radius = Math.random() * Math.max(viewW, viewH) * 0.9;
   return {
     x: Math.cos(angle) * radius,
     y: Math.sin(angle) * radius,
@@ -147,19 +198,19 @@ function updateStars() {
     if (s.z <= 1) { stars[i] = createStar(false); continue; }
     const sx = (s.x / s.z) * 500 + centerX;
     const sy = (s.y / s.z) * 500 + centerY;
-    if (sx < -100 || sx > canvas.width + 100 || sy < -100 || sy > canvas.height + 100) {
+    if (sx < -100 || sx > viewW + 100 || sy < -100 || sy > viewH + 100) {
       stars[i] = createStar(false);
     }
   }
 }
 
 function drawStars() {
-  // Faster trail fade on bass for sharper streaks
+  // ── Star layer → offscreen buffer with a partial fade, so stars leave a
+  // motion-blur trail that lengthens as they accelerate on the beat. ──
   const trailFade = 0.2 + bassSmooth * 0.12;
-  ctx.fillStyle = `rgba(0, 0, 0, ${trailFade})`;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  sctx.fillStyle = `rgba(0, 0, 5, ${trailFade})`;
+  sctx.fillRect(0, 0, viewW, viewH);
 
-  // Bass glow multiplier for star size and brightness
   const bassGlow = 1 + bassSmooth * 0.8;
 
   for (const s of stars) {
@@ -170,8 +221,8 @@ function drawStars() {
     const alpha = Math.min(1, depth * 1.4 * bassGlow) * s.brightness;
 
     // Fade out stars near center so text is readable
-    const dx = (sx - centerX) / canvas.width;
-    const dy = (sy - centerY) / canvas.height;
+    const dx = (sx - centerX) / viewW;
+    const dy = (sy - centerY) / viewH;
     const distFromCenter = Math.sqrt(dx * dx + dy * dy);
     const centerFade = Math.min(1, Math.max(0, (distFromCenter - 0.08) / 0.2));
     if (centerFade < 0.01) continue;
@@ -180,46 +231,51 @@ function drawStars() {
 
     if (depth > 0.55) {
       const streakAlpha = (depth - 0.55) * 1.8 * s.brightness * centerFade;
-      ctx.beginPath();
-      ctx.moveTo(s.prevX, s.prevY);
-      ctx.lineTo(sx, sy);
-      ctx.strokeStyle = s.hue
+      sctx.beginPath();
+      sctx.moveTo(s.prevX, s.prevY);
+      sctx.lineTo(sx, sy);
+      sctx.strokeStyle = s.hue
         ? `hsla(${s.hue}, 50%, 80%, ${streakAlpha * 0.3})`
         : `rgba(180, 190, 220, ${streakAlpha * 0.3})`;
-      ctx.lineWidth = size * 0.5;
-      ctx.stroke();
+      sctx.lineWidth = size * 0.5;
+      sctx.stroke();
     }
 
-    ctx.beginPath();
-    ctx.arc(sx, sy, size, 0, Math.PI * 2);
-    ctx.fillStyle = s.hue
+    sctx.beginPath();
+    sctx.arc(sx, sy, size, 0, Math.PI * 2);
+    sctx.fillStyle = s.hue
       ? `hsla(${s.hue}, 50%, 85%, ${fadedAlpha})`
       : `rgba(210, 215, 235, ${fadedAlpha})`;
-    ctx.fill();
+    sctx.fill();
 
     if (depth > 0.7 && size > 1.8) {
-      ctx.beginPath();
-      ctx.arc(sx, sy, size * 4, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(200, 210, 240, ${fadedAlpha * 0.04})`;
-      ctx.fill();
+      sctx.beginPath();
+      sctx.arc(sx, sy, size * 4, 0, Math.PI * 2);
+      sctx.fillStyle = `rgba(200, 210, 240, ${fadedAlpha * 0.04})`;
+      sctx.fill();
     }
   }
 
+  // ── Composite the star buffer onto the main canvas, which is fully cleared
+  // each frame so every glow effect drawn afterwards stays crisp (no smear). ──
+  ctx.fillStyle = '#000005';
+  ctx.fillRect(0, 0, viewW, viewH);
+  ctx.drawImage(starBuffer, 0, 0, viewW, viewH);
+
   // Black radial gradient overlay in center for text readability
-  const grad = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, Math.min(canvas.width, canvas.height) * 0.35);
+  const grad = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, Math.min(viewW, viewH) * 0.35);
   grad.addColorStop(0, 'rgba(0, 0, 0, 0.95)');
   grad.addColorStop(0.4, 'rgba(0, 0, 0, 0.7)');
   grad.addColorStop(0.7, 'rgba(0, 0, 0, 0.2)');
   grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
   ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillRect(0, 0, viewW, viewH);
 
-  // Bass corner glow - colored pulse from corners on heavy bass
-  // Glow is modulated by song intelligence - gentler during intros
+  // Bass corner glow — crisp, on the main layer so it never trails
   if (bassGlowEnabled && bassSmooth > 0.03) {
     const bAlpha = bassSmooth * 0.18;
     const gc = getGlowRGB();
-    const w = canvas.width, h = canvas.height;
+    const w = viewW, h = viewH;
     const cornerRadius = Math.max(w, h) * 0.5;
     const corners = [[0, 0], [w, 0], [0, h], [w, h]];
     for (const [cx, cy] of corners) {
@@ -242,16 +298,16 @@ function spawnComet() {
   let x, y, vx, vy;
   const speed = 4 + Math.random() * 6;
   if (side < 0.25) { // from left
-    x = -10; y = Math.random() * canvas.height;
+    x = -10; y = Math.random() * viewH;
     vx = speed; vy = (Math.random() - 0.5) * speed * 0.5;
   } else if (side < 0.5) { // from right
-    x = canvas.width + 10; y = Math.random() * canvas.height;
+    x = viewW + 10; y = Math.random() * viewH;
     vx = -speed; vy = (Math.random() - 0.5) * speed * 0.5;
   } else if (side < 0.75) { // from top
-    x = Math.random() * canvas.width; y = -10;
+    x = Math.random() * viewW; y = -10;
     vx = (Math.random() - 0.5) * speed * 0.5; vy = speed;
   } else { // from bottom
-    x = Math.random() * canvas.width; y = canvas.height + 10;
+    x = Math.random() * viewW; y = viewH + 10;
     vx = (Math.random() - 0.5) * speed * 0.5; vy = -speed;
   }
   comets.push({
@@ -292,7 +348,7 @@ function updateAndDrawComets() {
     ctx.fillStyle = `rgba(${c.r}, ${c.g}, ${c.b}, ${c.life * 0.15})`;
     ctx.fill();
 
-    if (c.life <= 0 || c.x < -100 || c.x > canvas.width + 100 || c.y < -100 || c.y > canvas.height + 100) {
+    if (c.life <= 0 || c.x < -100 || c.x > viewW + 100 || c.y < -100 || c.y > viewH + 100) {
       comets.splice(i, 1);
     }
   }
@@ -307,7 +363,7 @@ function emitShockwave() {
     x: widgetRect.left + widgetRect.width / 2,
     y: widgetRect.top + widgetRect.height / 2,
     radius: 0,
-    maxRadius: Math.max(canvas.width, canvas.height) * 1.2,
+    maxRadius: Math.max(viewW, viewH) * 1.2,
     speed: 8,
     life: 1
   });
@@ -359,6 +415,68 @@ function applyShockwaveToStars() {
   }
 }
 
+// ── Session-Reset Celebration ──
+
+function celebrateReset() {
+  const accent = getAccentRGB();
+  // green ("full tank") + white sparks + the current accent color
+  const palette = [[110, 231, 168], [255, 255, 255], [accent.r, accent.g, accent.b]];
+  for (let i = 0; i < 110; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 11;
+    const c = palette[(Math.random() * palette.length) | 0];
+    particles.push({
+      x: centerX, y: centerY,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 1,
+      decay: 0.006 + Math.random() * 0.012,
+      size: 1.5 + Math.random() * 3.5,
+      r: c[0], g: c[1], b: c[2]
+    });
+  }
+  // Centered shockwave + warm green flash
+  shockwaves.push({ x: centerX, y: centerY, radius: 0, maxRadius: Math.max(viewW, viewH) * 1.2, speed: 11, life: 1 });
+  celebFlash = 0.7;
+  showResetBanner();
+}
+
+function showResetBanner() {
+  const el = document.createElement('div');
+  el.className = 'reset-banner';
+  el.innerHTML = '<div class="reset-word">REFUELED</div><div class="reset-sub">fresh 5-hour session</div>';
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 2600);
+}
+
+function updateAndDrawParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.vx *= 0.97; p.vy *= 0.97;
+    p.vy += 0.04;            // gentle gravity so they arc down
+    p.life -= p.decay;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    const a = Math.max(0, p.life);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * (0.4 + a * 0.6), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${p.r}, ${p.g}, ${p.b}, ${a})`;
+    ctx.shadowColor = `rgba(${p.r}, ${p.g}, ${p.b}, ${a})`;
+    ctx.shadowBlur = 12;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+}
+
+function drawCelebrationFlash() {
+  if (celebFlash <= 0.01) { celebFlash = 0; return; }
+  ctx.save();
+  ctx.fillStyle = `rgba(110, 231, 168, ${celebFlash * 0.12})`;
+  ctx.fillRect(0, 0, viewW, viewH);
+  ctx.restore();
+  celebFlash *= 0.9;
+}
+
 // ── Gravitational Collapse ──
 
 function updateGravity() {
@@ -381,75 +499,248 @@ function applyGravityToStars() {
   }
 }
 
-// ── Screen Cracks at 95%+ ──
+// ── Lightning Storm at 95%+ usage ──
 
-function generateCracks() {
-  cracks = [];
-  const numCracks = 5 + Math.floor(Math.random() * 4);
-  for (let i = 0; i < numCracks; i++) {
-    const crack = [];
-    // Start from center area
-    let x = centerX + (Math.random() - 0.5) * 100;
-    let y = centerY + (Math.random() - 0.5) * 100;
-    const angle = Math.random() * Math.PI * 2;
-    const length = 8 + Math.floor(Math.random() * 12);
-    let dir = angle;
-    for (let j = 0; j < length; j++) {
-      crack.push({ x, y });
-      const step = 15 + Math.random() * 30;
-      dir += (Math.random() - 0.5) * 0.8;
-      x += Math.cos(dir) * step;
-      y += Math.sin(dir) * step;
-      // Branch occasionally
-      if (Math.random() < 0.2 && j > 2) {
-        const branch = [];
-        let bx = x, by = y;
-        let bdir = dir + (Math.random() - 0.5) * 1.5;
-        const blen = 3 + Math.floor(Math.random() * 5);
-        for (let k = 0; k < blen; k++) {
-          branch.push({ x: bx, y: by });
-          bdir += (Math.random() - 0.5) * 0.6;
-          bx += Math.cos(bdir) * (10 + Math.random() * 20);
-          by += Math.sin(bdir) * (10 + Math.random() * 20);
-        }
-        cracks.push(branch);
-      }
+// Build a jagged lightning path via recursive midpoint displacement
+// (the way real lightning forks). Returns an array of {x1,y1,x2,y2} segments.
+function makeBolt(x1, y1, x2, y2, displace, forkChance) {
+  const segs = [];
+  function divide(ax, ay, bx, by, disp, generation) {
+    if (disp < 6) {
+      segs.push({ x1: ax, y1: ay, x2: bx, y2: by });
+      return;
     }
-    cracks.push(crack);
+    const dx = bx - ax, dy = by - ay;
+    const len = Math.hypot(dx, dy) || 1;
+    // displace the midpoint perpendicular to the segment
+    const off = (Math.random() - 0.5) * disp;
+    const mx = (ax + bx) / 2 + (-dy / len) * off;
+    const my = (ay + by) / 2 + (dx / len) * off;
+    divide(ax, ay, mx, my, disp / 2, generation);
+    divide(mx, my, bx, by, disp / 2, generation);
+    // occasionally fork off a branch that dies out quickly
+    if (generation < 3 && Math.random() < forkChance) {
+      const ang = Math.atan2(my - ay, mx - ax) + (Math.random() - 0.5) * 1.4;
+      const flen = len * (0.4 + Math.random() * 0.5);
+      divide(mx, my, mx + Math.cos(ang) * flen, my + Math.sin(ang) * flen, disp / 1.6, generation + 1);
+    }
   }
-  cracksGenerated = true;
+  divide(x1, y1, x2, y2, displace, 0);
+  return segs;
 }
 
-function drawCracks() {
-  const targetAlpha = usagePct >= 95 ? Math.min(1, (usagePct - 95) / 5) : 0;
-  crackAlpha += (targetAlpha - crackAlpha) * 0.03;
+function spawnBolt() {
+  // Strike from a random screen edge toward an off-center target so bolts
+  // rake across the whole screen, not just the middle.
+  const w = viewW, h = viewH;
+  const edge = Math.floor(Math.random() * 4);
+  let sx, sy;
+  if (edge === 0) { sx = Math.random() * w; sy = -20; }
+  else if (edge === 1) { sx = Math.random() * w; sy = h + 20; }
+  else if (edge === 2) { sx = -20; sy = Math.random() * h; }
+  else { sx = w + 20; sy = Math.random() * h; }
+  const tx = w * (0.3 + Math.random() * 0.4);
+  const ty = h * (0.3 + Math.random() * 0.4);
+  const reach = Math.hypot(tx - sx, ty - sy);
 
-  if (crackAlpha < 0.01) { cracksGenerated = false; return; }
-  if (!cracksGenerated) generateCracks();
+  bolts.push({
+    segs: makeBolt(sx, sy, tx, ty, reach * 0.35, 0.45),
+    life: 1,
+    decay: 0.06 + Math.random() * 0.08,     // ~150-280ms lifetime
+    flickerSeed: Math.random() * 1000,
+    width: 1.4 + Math.random() * 1.6
+  });
 
-  const pulse = 0.6 + Math.sin(Date.now() * 0.003) * 0.4;
+  // Bright strikes briefly light the whole scene
+  screenFlash = Math.min(1, screenFlash + 0.35 + Math.random() * 0.25);
+}
 
-  for (const crack of cracks) {
-    if (crack.length < 2) continue;
-    // Glowing crack line
-    ctx.beginPath();
-    ctx.moveTo(crack[0].x, crack[0].y);
-    for (let i = 1; i < crack.length; i++) {
-      ctx.lineTo(crack[i].x, crack[i].y);
-    }
-    // Hot white core
-    ctx.strokeStyle = `rgba(255, 200, 150, ${crackAlpha * pulse * 0.8})`;
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    // Orange glow
-    ctx.strokeStyle = `rgba(255, 100, 30, ${crackAlpha * pulse * 0.5})`;
-    ctx.lineWidth = 4;
-    ctx.stroke();
-    // Wide red glow
-    ctx.strokeStyle = `rgba(220, 40, 40, ${crackAlpha * pulse * 0.15})`;
-    ctx.lineWidth = 12;
-    ctx.stroke();
+function strokeBolt(b) {
+  ctx.beginPath();
+  for (const s of b.segs) {
+    ctx.moveTo(s.x1, s.y1);
+    ctx.lineTo(s.x2, s.y2);
   }
+  ctx.stroke();
+}
+
+function drawLightning() {
+  const targetAlpha = usagePct >= 95 ? Math.min(1, (usagePct - 95) / 5) : 0;
+  crackAlpha += (targetAlpha - crackAlpha) * 0.04;
+
+  if (crackAlpha < 0.01 && bolts.length === 0 && screenFlash < 0.01) {
+    bolts.length = 0;
+    return;
+  }
+
+  const now = Date.now();
+
+  // One occasional strike at a time — never a swarm, since you can sit at
+  // 100% for a long time and a constant storm looks bad.
+  if (crackAlpha > 0.4 && bolts.length === 0 && now >= nextStrikeAt) {
+    spawnBolt();
+    nextStrikeAt = now + 2200 + Math.random() * 3800;    // a bolt every ~2-6s
+  }
+
+  // Warm full-screen flash from recent strikes
+  if (screenFlash > 0.01) {
+    ctx.save();
+    ctx.fillStyle = `rgba(255, 90, 60, ${screenFlash * 0.10 * crackAlpha})`;
+    ctx.fillRect(0, 0, viewW, viewH);
+    ctx.restore();
+    screenFlash *= 0.82;
+  }
+
+  // Draw and age each bolt
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (let i = bolts.length - 1; i >= 0; i--) {
+    const b = bolts[i];
+    // erratic flicker so the bolt stutters like real lightning
+    const flick = 0.55 + Math.abs(Math.sin(now * 0.05 + b.flickerSeed)) * 0.45;
+    const a = b.life * flick * crackAlpha;
+
+    // Wide red outer glow (bloom via shadow)
+    ctx.shadowColor = `rgba(255, 60, 40, ${a})`;
+    ctx.shadowBlur = 24;
+    ctx.strokeStyle = `rgba(255, 50, 30, ${a * 0.35})`;
+    ctx.lineWidth = b.width * 6;
+    strokeBolt(b);
+
+    // Orange mid glow
+    ctx.shadowBlur = 12;
+    ctx.strokeStyle = `rgba(255, 150, 60, ${a * 0.6})`;
+    ctx.lineWidth = b.width * 2.4;
+    strokeBolt(b);
+
+    // White-hot core
+    ctx.shadowColor = `rgba(255, 220, 180, ${a})`;
+    ctx.shadowBlur = 8;
+    ctx.strokeStyle = `rgba(255, 245, 235, ${Math.min(1, a * 1.3)})`;
+    ctx.lineWidth = b.width;
+    strokeBolt(b);
+
+    b.life -= b.decay;
+    if (b.life <= 0) bolts.splice(i, 1);
+  }
+  ctx.restore();
+}
+
+// ── Session History Graph (elegant, centered, themed) ──
+
+function drawHistoryGraph() {
+  // Drawn on the overlay layer, which is never shaken by the beat — so it
+  // stays perfectly fixed. Clear it every frame (even when hidden).
+  octx.clearRect(0, 0, viewW, viewH);
+
+  if (!historyEnabled) return;
+  const data = sessionHistory.slice(-14);   // last N sessions, kept readable
+  const n = data.length;
+  if (n === 0) return;
+
+  const w = viewW;
+  const h = viewH;
+  const gc = getAccentRGB();
+  const col = (a) => `rgba(${gc.r}, ${gc.g}, ${gc.b}, ${a})`;
+
+  // Centered, not full width
+  const chartW = Math.min(w * 0.6, 760);
+  const left = (w - chartW) / 2;
+  const baseY = h - 54;                      // baseline, with room for caption
+  const maxH = Math.min(h * 0.15, 120);
+  const slot = chartW / n;
+  const barW = Math.min(slot * 0.34, 13);
+
+  octx.save();
+  octx.textAlign = 'center';
+  octx.textBaseline = 'alphabetic';
+
+  // Whisper-faint baseline that fades out at both ends
+  const baseGrad = octx.createLinearGradient(left, 0, left + chartW, 0);
+  baseGrad.addColorStop(0, col(0));
+  baseGrad.addColorStop(0.5, col(0.10));
+  baseGrad.addColorStop(1, col(0));
+  octx.strokeStyle = baseGrad;
+  octx.lineWidth = 1;
+  octx.beginPath();
+  octx.moveTo(left, baseY + 0.5);
+  octx.lineTo(left + chartW, baseY + 0.5);
+  octx.stroke();
+
+  for (let i = 0; i < n; i++) {
+    const v = Math.min(100, Math.max(0, data[i].peak));
+    const cx = left + slot * (i + 0.5);
+    const barH = Math.max((v / 100) * maxH, 2);
+    const y = baseY - barH;
+    const isLast = i === n - 1;
+
+    // Bar: soft column that dissolves completely into the background at its base
+    const g = octx.createLinearGradient(0, y, 0, baseY);
+    g.addColorStop(0, col(isLast ? 0.55 : 0.26));
+    g.addColorStop(0.55, col(isLast ? 0.18 : 0.09));
+    g.addColorStop(1, col(0));
+    octx.fillStyle = g;
+    const r = Math.min(barW / 2, 4);
+    octx.beginPath();
+    octx.roundRect(cx - barW / 2, y, barW, barH, [r, r, 0, 0]);
+    octx.fill();
+
+    // Soft glowing cap on top of the bar
+    octx.fillStyle = col(isLast ? 0.95 : 0.55);
+    octx.shadowColor = col(0.7);
+    octx.shadowBlur = isLast ? 14 : 6;
+    octx.beginPath();
+    octx.roundRect(cx - barW / 2, y, barW, 1.6, 0.8);
+    octx.fill();
+    octx.shadowBlur = 0;
+
+    // Value label above the bar (latest one brighter)
+    octx.fillStyle = col(isLast ? 0.85 : 0.38);
+    octx.font = `${isLast ? 600 : 400} 10px "JetBrains Mono", monospace`;
+    octx.fillText(`${v}%`, cx, y - 7);
+  }
+
+  // Captions under the baseline
+  octx.shadowBlur = 0;
+  octx.font = '500 8px "Space Grotesk", sans-serif';
+  octx.letterSpacing = '2.5px';
+  octx.fillStyle = col(0.22);
+  octx.textAlign = 'left';
+  octx.fillText('SESSION HISTORY', left, baseY + 18);
+  octx.textAlign = 'right';
+  octx.fillText(`PEAK · LAST ${n}`, left + chartW, baseY + 18);
+  octx.letterSpacing = '0px';
+
+  octx.restore();
+}
+
+// ── Film grain / dither overlay ──
+// A faint static noise layer that breaks up gradient banding on large hi-res
+// screens, giving the smooth, shader-like look of dithered rendering.
+let grainPattern = null;
+function buildGrain() {
+  const size = 140;
+  const nc = document.createElement('canvas');
+  nc.width = size; nc.height = size;
+  const nctx = nc.getContext('2d');
+  const img = nctx.createImageData(size, size);
+  for (let i = 0; i < img.data.length; i += 4) {
+    const v = (Math.random() * 255) | 0;
+    img.data[i] = v; img.data[i + 1] = v; img.data[i + 2] = v; img.data[i + 3] = 255;
+  }
+  nctx.putImageData(img, 0, 0);
+  grainPattern = ctx.createPattern(nc, 'repeat');
+}
+
+function drawGrain() {
+  if (!grainPattern) buildGrain();
+  ctx.save();
+  ctx.globalAlpha = 0.045;
+  ctx.globalCompositeOperation = 'overlay';
+  ctx.fillStyle = grainPattern;
+  ctx.fillRect(0, 0, viewW, viewH);
+  ctx.restore();
 }
 
 function animateStarfield() {
@@ -460,9 +751,13 @@ function animateStarfield() {
   applyShockwaveToStars();
   updateStars();
   drawStars();
+  drawHistoryGraph();
   updateAndDrawComets();
   updateAndDrawShockwaves();
-  drawCracks();
+  updateAndDrawParticles();
+  drawLightning();
+  drawCelebrationFlash();
+  drawGrain();
   requestAnimationFrame(animateStarfield);
 }
 
@@ -513,7 +808,8 @@ let autoRefreshInterval = null;
 let isFetching = false;
 let showWeekly = localStorage.getItem('showWeekly') === 'true';
 let moneyMode = localStorage.getItem('moneyMode') === 'true';
-let musicEnabled = localStorage.getItem('musicEnabled') === 'true';
+let tokensMode = localStorage.getItem('tokensMode') === 'true';
+// musicEnabled is declared near the top (read early by the render loop)
 
 // Money mode state - accumulates across sessions
 let totalMoney = parseFloat(localStorage.getItem('totalMoney')) || 0;
@@ -525,14 +821,42 @@ let lastPct = 0;
 let lastPctTime = 0;
 let moneyTickRunning = false;
 
-// Estimated API cost per full session (100%) in dollars
-// Claude Opus 4.6 with 1M context window:
-//   Input: $15/MTok - each message with full context ≈ $15
-//   Output: $75/MTok - avg response ≈ $2-4
-//   100% session ≈ 100+ exchanges ≈ $1,800 in real API costs
-// This is the actual compute cost Anthropic subsidizes behind the subscription
-const DEFAULT_COST_PER_SESSION = 1800;
-let COST_PER_SESSION = parseFloat(localStorage.getItem('costPerSession')) || DEFAULT_COST_PER_SESSION;
+// Per-session estimates are expressed PER PRO TIER and scaled by the detected
+// plan factor (Max 5x → ×5, Max 20x → ×20). The claude.ai API only exposes
+// utilization %, not absolute token/$ budgets — so these stay estimates, but
+// plan-accurate ones once the subscription tier is detected.
+let plan = null;                          // { key, label, factor, tier } from the API
+const PRO_COST_PER_SESSION = 90;          // ~$ of real API compute for a full Pro session
+const PRO_TOKENS_PER_SESSION = 1000000;   // ~tokens of real compute for a full Pro session
+let COST_PER_SESSION = parseFloat(localStorage.getItem('costPerSession')) || PRO_COST_PER_SESSION;
+
+// ── Tokens mode state ──
+let TOKENS_PER_SESSION = parseFloat(localStorage.getItem('tokensPerSession')) || PRO_TOKENS_PER_SESSION;
+let tokensDirection = localStorage.getItem('tokensDirection') || 'remaining'; // 'remaining' | 'consumed'
+let displayedTokens = TOKENS_PER_SESSION;
+let targetTokens = TOKENS_PER_SESSION;
+let tokenBurn = 0;            // tokens/sec drain estimate between refreshes
+let tokensTickRunning = false;
+let lastTokenTick = 0;
+
+// Target token count for a given utilization %, honoring the chosen direction
+function tokensTargetFor(util) {
+  const u = Math.min(100, Math.max(0, util)) / 100;
+  return TOKENS_PER_SESSION * (tokensDirection === 'consumed' ? u : (1 - u));
+}
+
+// Apply a detected plan: auto-scale budgets to the tier unless the user set
+// their own values in settings.
+function applyPlan(p) {
+  if (!p || !p.factor) return;
+  plan = p;
+  if (!localStorage.getItem('costPerSession')) {
+    COST_PER_SESSION = Math.round(PRO_COST_PER_SESSION * p.factor);
+  }
+  if (!localStorage.getItem('tokensPerSession')) {
+    TOKENS_PER_SESSION = Math.round(PRO_TOKENS_PER_SESSION * p.factor);
+  }
+}
 
 const WARN = 75;
 const DANGER = 90;
@@ -566,6 +890,8 @@ async function init() {
   }
   if (moneyMode) {
     applyMoneyMode();
+  } else if (tokensMode) {
+    applyTokensMode();
   }
   if (musicEnabled) {
     startMediaPolling();
@@ -655,7 +981,7 @@ function showResetConfirm() {
 // Color Picker
 // ═══════════════════════════════════════════════
 
-let fontColor = localStorage.getItem('fontColor') || '#ffffff';
+// fontColor is declared near the top (needed early by the render loop)
 let fontSize = parseInt(localStorage.getItem('fontSize')) || 100; // percentage scale (50-200)
 let colorPopup = null;
 
@@ -680,10 +1006,27 @@ function getGlowRGB() {
   return { r: 100, g: 100, b: 255 };
 }
 
+// Accent color = whatever color the big percentage is currently shown in
+// (album-art theme while music plays, otherwise the chosen font color).
+function getAccentRGB() {
+  if (musicEnabled && themeColor && currentMedia && currentMedia.status === 'Playing') {
+    return themeColor;
+  }
+  const hex = /^#[0-9a-fA-F]{6}$/.test(fontColor) ? fontColor : '#ffffff';
+  return {
+    r: parseInt(hex.slice(1, 3), 16),
+    g: parseInt(hex.slice(3, 5), 16),
+    b: parseInt(hex.slice(5, 7), 16)
+  };
+}
+
 function applyFontSize(size) {
   fontSize = size;
   localStorage.setItem('fontSize', size);
-  dom.sessionPct.style.fontSize = `calc(${size / 100} * ${moneyMode ? 'clamp(64px, 12vw, 280px)' : 'clamp(72px, 14vw, 320px)'})`;
+  const clamp = tokensMode ? 'clamp(40px, 8.5vw, 180px)'
+              : moneyMode ? 'clamp(64px, 12vw, 280px)'
+              : 'clamp(72px, 14vw, 320px)';
+  dom.sessionPct.style.fontSize = `calc(${size / 100} * ${clamp})`;
   document.documentElement.style.setProperty('--font-scale', size / 100);
 }
 
@@ -718,11 +1061,13 @@ function toggleSettings() {
 
   let html = `
     <div class="settings-section">
-      <div class="settings-title">Features</div>
+      <div class="settings-title">Features${plan ? ` <span style="font-weight:400;color:rgba(255,255,255,0.3);font-size:11px;letter-spacing:0;">· ${plan.label}</span>` : ''}</div>
       <div class="settings-row"><span class="settings-label">Music Visualization</span><div class="toggle-switch${musicEnabled ? ' active' : ''}" data-toggle="music"></div></div>
       <div class="settings-row"><span class="settings-label">Bass Corner Glow</span><div class="toggle-switch${bassGlowEnabled ? ' active' : ''}" data-toggle="bassGlow"></div></div>
       <div class="settings-row"><span class="settings-label">Money Mode</span><div class="toggle-switch${moneyMode ? ' active' : ''}" data-toggle="money"></div></div>
+      <div class="settings-row"><span class="settings-label">Tokens Mode</span><div class="toggle-switch${tokensMode ? ' active' : ''}" data-toggle="tokens"></div></div>
       <div class="settings-row"><span class="settings-label">Weekly View</span><div class="toggle-switch${showWeekly ? ' active' : ''}" data-toggle="weekly"></div></div>
+      <div class="settings-row"><span class="settings-label">Usage History</span><div class="toggle-switch${historyEnabled ? ' active' : ''}" data-toggle="history"></div></div>
     </div>
 
     <div class="settings-section">
@@ -775,6 +1120,22 @@ function toggleSettings() {
     </div>`;
   }
 
+  if (tokensMode) {
+    html += `
+    <div class="settings-section">
+      <div class="settings-title">Tokens Config</div>
+      <div class="settings-row"><span class="settings-label">Count Up (used)</span><div class="toggle-switch${tokensDirection === 'consumed' ? ' active' : ''}" data-toggle="tokensDir"></div></div>
+      <div class="settings-row" style="gap:8px;">
+        <span class="settings-label" style="white-space:nowrap;">tokens/session</span>
+        <div class="color-hex-row" style="flex:1;">
+          <input type="number" class="color-hex-input tokens-input" value="${TOKENS_PER_SESSION}" min="1000" step="1000000" style="width:110px;" />
+          <button class="color-apply-btn tokens-apply">Set</button>
+        </div>
+      </div>
+      <div class="settings-hint" style="font-size:11px;color:rgba(255,255,255,0.35);margin-top:6px;">${plan ? `Auto-scaled to ${plan.label} (×${plan.factor}). ` : ''}Counts down from this budget as the session fills up.</div>
+    </div>`;
+  }
+
   html += `
     <div class="settings-section" style="border:none;margin:0;padding:0;">
       <div class="settings-actions">
@@ -802,13 +1163,32 @@ function toggleSettings() {
       } else if (key === 'bassGlow') {
         bassGlowEnabled = on;
         localStorage.setItem('bassGlowEnabled', on);
+      } else if (key === 'history') {
+        historyEnabled = on;
+        localStorage.setItem('historyEnabled', on);
       } else if (key === 'money') {
         moneyMode = on;
         localStorage.setItem('moneyMode', on);
+        if (on && tokensMode) { tokensMode = false; localStorage.setItem('tokensMode', false); stopTokensTick(); }
         applyMoneyMode();
         if (on) { targetMoney = totalMoney; displayedMoney = totalMoney; renderMoneyDisplay(); }
         // Rebuild popup to show/hide money config
         settingsPopup.remove(); settingsPopup = null; toggleSettings();
+      } else if (key === 'tokens') {
+        tokensMode = on;
+        localStorage.setItem('tokensMode', on);
+        if (on && moneyMode) { moneyMode = false; localStorage.setItem('moneyMode', false); stopMoneyTick(); }
+        applyTokensMode();
+        // Rebuild popup to show/hide tokens config
+        settingsPopup.remove(); settingsPopup = null; toggleSettings();
+      } else if (key === 'tokensDir') {
+        tokensDirection = on ? 'consumed' : 'remaining';
+        localStorage.setItem('tokensDirection', tokensDirection);
+        if (tokensMode) {
+          dom.usageLabel.textContent = tokensDirection === 'consumed' ? 'TOKENS USED' : 'TOKENS LEFT';
+          // recompute target; the tick lerps the flip smoothly
+          targetTokens = tokensTargetFor(usageData?.five_hour?.utilization || lastPct || 0);
+        }
       } else if (key === 'weekly') {
         showWeekly = on;
         localStorage.setItem('showWeekly', on);
@@ -888,6 +1268,24 @@ function toggleSettings() {
   const resetBtn = popup.querySelector('#settingsResetMoney');
   if (resetBtn) resetBtn.addEventListener('click', () => { settingsPopup.remove(); settingsPopup = null; showResetConfirm(); });
 
+  // ── Tokens config ──
+  const tokensApply = popup.querySelector('.tokens-apply');
+  if (tokensApply) {
+    const tokensInput = popup.querySelector('.tokens-input');
+    tokensApply.addEventListener('click', () => {
+      const val = parseFloat(tokensInput.value);
+      if (val > 0) {
+        TOKENS_PER_SESSION = val;
+        localStorage.setItem('tokensPerSession', val);
+        const util = usageData?.five_hour?.utilization || lastPct || 0;
+        targetTokens = tokensTargetFor(util);
+        displayedTokens = targetTokens;
+        if (tokensMode) renderTokensDisplay();
+      }
+    });
+    tokensInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') tokensApply.click(); });
+  }
+
   // ── Actions ──
   popup.querySelector('#settingsFullscreen').addEventListener('click', () => window.electronAPI.toggleFullscreen());
   popup.querySelector('#settingsLogout').addEventListener('click', async () => {
@@ -957,15 +1355,36 @@ function renderMoneyDisplay() {
   dom.sessionPct.className = 'usage-pct money-mode';
 }
 
+// Record the peak utilization of a session that just reset, into history
+function recordSessionEnd() {
+  if (sessionPeak >= 1) {
+    sessionHistory.push({ peak: Math.round(sessionPeak), t: Date.now() });
+    if (sessionHistory.length > 60) sessionHistory = sessionHistory.slice(-60);
+    localStorage.setItem('sessionHistory', JSON.stringify(sessionHistory));
+  }
+  sessionPeak = 0;
+  localStorage.setItem('sessionPeak', '0');
+}
+
 // Called when new usage data arrives - accumulates cost and recalculates burn rate
 function onNewUsageData(newPct) {
   const now = Date.now();
 
   // Detect session reset (utilization dropped significantly)
   if (newPct < lastSessionPct - 10) {
-    // Session reset happened - the old session's cost is already accumulated
-    // Start tracking new session from current pct
+    // Session reset happened - record the session that just ended (for history),
+    // its cost is already accumulated; start tracking the new session from current pct
+    recordSessionEnd();
     lastSessionPct = 0;
+    // Celebrate the refuel — but not on the very first fetch of this run, which
+    // could just be stale saved state rather than a reset we actually witnessed.
+    if (!firstUsageFetch) celebrateReset();
+  }
+
+  // Track the peak utilization of the current session for the history graph
+  if (newPct > sessionPeak) {
+    sessionPeak = newPct;
+    localStorage.setItem('sessionPeak', sessionPeak.toFixed(2));
   }
 
   // Calculate delta cost since last known session percentage
@@ -981,9 +1400,14 @@ function onNewUsageData(newPct) {
     const elapsed = (now - lastPctTime) / 1000;
     const deltaPct = newPct - lastPct;
     burnRate = (deltaPct / 100 * COST_PER_SESSION) / elapsed;
+    tokenBurn = (deltaPct / 100 * TOKENS_PER_SESSION) / elapsed;
   } else if (newPct <= lastPct) {
     burnRate = 0;
+    tokenBurn = 0;
   }
+
+  // Tokens remaining/used = budget scaled by session progress (direction-aware)
+  targetTokens = tokensTargetFor(newPct);
 
   lastSessionPct = newPct;
   localStorage.setItem('lastSessionPct', lastSessionPct.toFixed(4));
@@ -994,7 +1418,9 @@ function onNewUsageData(newPct) {
   // In money mode the tick loop handles smooth animation
   // In pct mode we don't touch the display here (updateSessionUI does it)
   updateCornerPulse(newPct);
+  firstUsageFetch = false;
 }
+let firstUsageFetch = true;
 
 // Continuous tick - smooth lerp animation + burn rate between refreshes
 let lastTickTime = 0;
@@ -1044,6 +1470,85 @@ function stopMoneyTick() {
   lastTickTime = 0;
   // Save accumulated total when stopping
   localStorage.setItem('totalMoney', totalMoney.toFixed(4));
+}
+
+// ═══════════════════════════════════════════════
+// Tokens Mode (session token budget draining toward 0)
+// ═══════════════════════════════════════════════
+
+function applyTokensMode() {
+  if (tokensMode) {
+    dom.sessionBarWrap.style.display = 'none';
+    dom.usageLabel.textContent = tokensDirection === 'consumed' ? 'TOKENS USED' : 'TOKENS LEFT';
+    const util = usageData?.five_hour?.utilization || lastPct || 0;
+    targetTokens = tokensTargetFor(util);
+    displayedTokens = targetTokens;
+    renderTokensDisplay();
+    startTokensTick();
+  } else {
+    dom.sessionBarWrap.style.display = '';
+    dom.usageLabel.textContent = 'CURRENT SESSION';
+    stopTokensTick();
+    if (usageData) updateSessionUI();
+  }
+  if (fontSize !== 100) applyFontSize(fontSize);
+}
+
+function renderTokensDisplay() {
+  const val = Math.max(0, Math.round(displayedTokens));
+  const str = val.toLocaleString('en-US');
+
+  let html = '';
+  for (const ch of str) {
+    if (ch >= '0' && ch <= '9') html += `<span class="money-digit">${ch}</span>`;
+    else html += `<span class="money-sep">${ch}</span>`;
+  }
+  html += `<span class="tokens-unit">tok</span>`;
+
+  dom.sessionPct.innerHTML = html;
+  dom.sessionPct.className = 'usage-pct money-mode tokens-mode';
+}
+
+function tokensTick(now) {
+  if (!tokensTickRunning) return;
+
+  if (lastTokenTick > 0) {
+    const dt = (now - lastTokenTick) / 1000;
+    if (dt < 2) {
+      // Continuously move toward the limit between refreshes at the estimated
+      // rate — draining toward 0, or filling toward the budget if counting up.
+      if (tokenBurn > 0) {
+        if (tokensDirection === 'consumed') {
+          targetTokens = Math.min(TOKENS_PER_SESSION, targetTokens + tokenBurn * dt);
+        } else {
+          targetTokens = Math.max(0, targetTokens - tokenBurn * dt);
+        }
+      }
+      // Smooth lerp toward the target
+      const diff = targetTokens - displayedTokens;
+      if (Math.abs(diff) > 0.5) {
+        displayedTokens += diff * (1 - Math.exp(-LERP_SPEED * dt));
+        renderTokensDisplay();
+      } else if (displayedTokens !== targetTokens) {
+        displayedTokens = targetTokens;
+        renderTokensDisplay();
+      }
+    }
+  }
+  lastTokenTick = now;
+  requestAnimationFrame(tokensTick);
+}
+
+function startTokensTick() {
+  if (tokensTickRunning) return;
+  tokensTickRunning = true;
+  lastTokenTick = 0;
+  requestAnimationFrame(tokensTick);
+}
+
+function stopTokensTick() {
+  tokensTickRunning = false;
+  lastTokenTick = 0;
 }
 
 // ═══════════════════════════════════════════════
@@ -1126,13 +1631,16 @@ async function fetchUsageData() {
       usageData = await window.electronAPI.fetchUsageData();
       const newPct = usageData.five_hour?.utilization || 0;
 
+      // Scale token/cost budgets to the detected subscription plan
+      if (usageData.plan) applyPlan(usageData.plan);
+
       // Always track spending data regardless of mode
       onNewUsageData(newPct);
 
       // Always update timers (resets_at / countdown)
       updateTimers();
 
-      if (!moneyMode) {
+      if (!moneyMode && !tokensMode) {
         updateSessionUI();
       }
 
@@ -1359,9 +1867,18 @@ async function pollMediaInfo() {
 
     showNowPlaying(info, songChanged);
 
-    if (songChanged && info.thumb) {
+    // Pursue the track's theme color whenever we don't have one yet — not only
+    // on song change — so the percentage reliably tints even if the artwork
+    // (SMTC thumbnail or web fallback) arrives late or was missed.
+    if (info.thumb && (songChanged || !themeColor)) {
       extractThemeColor(info.thumb, info.thumbType);
+    } else if (!info.thumb && info.title && (songChanged || !themeColor)) {
+      fetchAlbumArt(info.title, info.artist);   // cached; sets themeColor on success
     }
+
+    // Re-assert the percentage color every poll so it stays tinted while the
+    // song plays (and reverts to your chosen color when paused/stopped).
+    applyThemeColor();
   } catch (e) {
     // Silently fail - music detection is optional
   }
@@ -1696,7 +2213,7 @@ function updateBassLevel() {
 
 function onBassKick(intensity) {
   // Scale shake with screen size for bigger impact on large displays
-  const screenScale = Math.max(1, Math.min(2, canvas.height / 800));
+  const screenScale = Math.max(1, Math.min(2, viewH / 800));
   const force = Math.min(14 * screenScale, intensity * 22 * screenScale);
   shakeY = -force;
   shakeVelocity = force * 0.6;

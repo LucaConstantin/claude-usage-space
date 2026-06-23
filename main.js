@@ -205,13 +205,19 @@ ipcMain.handle('fetch-usage-data', async () => {
   const usageUrl = `https://claude.ai/api/organizations/${organizationId}/usage`;
   const overageUrl = `https://claude.ai/api/organizations/${organizationId}/overage_spend_limit`;
   const prepaidUrl = `https://claude.ai/api/organizations/${organizationId}/prepaid/credits`;
+  const orgsUrl = `https://claude.ai/api/organizations`;
 
   let data;
   try {
-    const results = await fetchMultipleViaWindow([usageUrl, overageUrl, prepaidUrl]);
+    const results = await fetchMultipleViaWindow([usageUrl, overageUrl, prepaidUrl, orgsUrl]);
     data = results[0];
     const overage = results[1];
     const prepaid = results[2];
+    const orgs = results[3];
+
+    // Detect the subscription plan (Pro / Max 5x / Max 20x / …) so the renderer
+    // can scale its token/cost estimates to the user's actual tier.
+    data.plan = detectPlan(orgs, organizationId);
 
     // Merge overage spending data
     if (overage) {
@@ -255,6 +261,29 @@ ipcMain.handle('fetch-usage-data', async () => {
 
   return data;
 });
+
+// Derive the subscription plan + a usage multiplier relative to Pro (×1),
+// from the org's rate_limit_tier / capabilities. Used to scale cost/token
+// estimates, since the API exposes utilization % but not absolute budgets.
+function detectPlan(orgs, organizationId) {
+  const list = Array.isArray(orgs) ? orgs : [];
+  const org = list.find(o => (o.uuid || o.id) === organizationId)
+    || list.find(o => (o.capabilities || []).includes('chat'))
+    || list[0];
+  const tier = (org && org.rate_limit_tier) || '';
+  const caps = (org && org.capabilities) || [];
+
+  let key = 'unknown', label = 'Unknown', factor = 1;
+  if (/max[_-]?20x/i.test(tier)) { key = 'max_20x'; label = 'Max 20x'; factor = 20; }
+  else if (/max[_-]?5x/i.test(tier)) { key = 'max_5x'; label = 'Max 5x'; factor = 5; }
+  else if (/max/i.test(tier) || caps.includes('claude_max')) { key = 'max'; label = 'Max'; factor = 5; }
+  else if (/pro/i.test(tier) || caps.includes('claude_pro')) { key = 'pro'; label = 'Pro'; factor = 1; }
+  else if (/free/i.test(tier)) { key = 'free'; label = 'Free'; factor = 0.2; }
+  else if (caps.includes('raven') || org?.raven_type) { key = 'team'; label = 'Team'; factor = 1; }
+  else if (caps.includes('chat')) { key = 'pro'; label = 'Pro'; factor = 1; }
+
+  return { key, label, factor, tier };
+}
 
 // IPC: Quit app
 ipcMain.on('quit-app', () => {
