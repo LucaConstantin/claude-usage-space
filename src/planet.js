@@ -15,6 +15,9 @@ let isActive = false;
 let loaded = false;
 let showProgress = 0; // 0 = hidden, 1 = fully visible
 let targetShow = 0;
+let ambient = false;        // visible as a backdrop (behind the account cards)
+let ambientMax = 0.6;       // opacity cap while ambient (settings shows it fully)
+let settingsActive = false; // settings scene currently displaying the planet
 let rotationAngle = 0;
 
 // The 3 model parts
@@ -207,8 +210,8 @@ function animate() {
     window._planetGlow.opacity = 0.05 + Math.sin(Date.now() * 0.002) * 0.015;
   }
 
-  // Canvas opacity
-  planetCanvas.style.opacity = showProgress.toFixed(3);
+  // Canvas opacity (capped while used as an ambient backdrop)
+  planetCanvas.style.opacity = (showProgress * (settingsActive ? 1 : ambientMax)).toFixed(3);
 
   renderer.render(scene, camera);
 }
@@ -235,8 +238,8 @@ window.PlanetScene = {
   },
 
   show() {
-    console.log('[Planet] show() - loaded:', loaded, 'canvas:', !!planetCanvas);
     if (!loaded || !planetCanvas) return;
+    settingsActive = true;
     isActive = true;
     targetShow = 1;
     planetCanvas.style.display = 'block';
@@ -249,13 +252,28 @@ window.PlanetScene = {
   },
 
   hide() {
-    targetShow = 0;
+    settingsActive = false;
+    targetShow = ambient ? 1 : 0;
 
     // Fade UI content back in
     const usageCenter = document.querySelector('.usage-center');
     if (usageCenter) {
       usageCenter.style.transition = 'opacity 0.8s ease 0.3s';
       usageCenter.style.opacity = '1';
+    }
+  },
+
+  // Ambient backdrop mode (behind the multi-account cards)
+  setAmbient(on) {
+    if (!loaded || !planetCanvas) return;
+    ambient = !!on;
+    if (ambient) {
+      isActive = true;
+      targetShow = 1;
+      planetCanvas.style.display = 'block';
+      if (!animFrameId) animate();
+    } else {
+      targetShow = settingsActive ? 1 : 0;
     }
   },
 

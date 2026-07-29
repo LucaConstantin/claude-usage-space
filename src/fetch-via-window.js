@@ -27,7 +27,7 @@ function parseResponseBody(bodyText) {
   }
 }
 
-function fetchViaWindow(url, { timeoutMs = 30000 } = {}) {
+function fetchViaWindow(url, { timeoutMs = 30000, partition } = {}) {
   return new Promise((resolve, reject) => {
     const win = new BrowserWindow({
       width: 800,
@@ -35,7 +35,8 @@ function fetchViaWindow(url, { timeoutMs = 30000 } = {}) {
       show: false,
       webPreferences: {
         nodeIntegration: false,
-        contextIsolation: true
+        contextIsolation: true,
+        ...(partition ? { partition } : {})
       }
     });
 
@@ -78,11 +79,11 @@ function fetchViaWindow(url, { timeoutMs = 30000 } = {}) {
   });
 }
 
-function fetchMultipleViaWindow(urls, { timeoutMs = 15000 } = {}) {
+function fetchMultipleViaWindow(urls, { timeoutMs = 15000, partition } = {}) {
   return new Promise((resolve, reject) => {
     const win = new BrowserWindow({
       width: 800, height: 600, show: false,
-      webPreferences: { nodeIntegration: false, contextIsolation: true }
+      webPreferences: { nodeIntegration: false, contextIsolation: true, ...(partition ? { partition } : {}) }
     });
 
     let settled = false;

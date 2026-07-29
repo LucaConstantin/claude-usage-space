@@ -32415,6 +32415,9 @@ void main() {
   var loaded = false;
   var showProgress = 0;
   var targetShow = 0;
+  var ambient = false;
+  var ambientMax = 0.6;
+  var settingsActive = false;
   var rotationAngle = 0;
   var planetMesh = null;
   var clouds0Mesh = null;
@@ -32560,7 +32563,7 @@ void main() {
       window._planetGlow.color.setRGB(currentTint.r * 0.7 + 0.3, currentTint.g * 0.7 + 0.3, currentTint.b * 0.7 + 0.3);
       window._planetGlow.opacity = 0.05 + Math.sin(Date.now() * 2e-3) * 0.015;
     }
-    planetCanvas.style.opacity = showProgress.toFixed(3);
+    planetCanvas.style.opacity = (showProgress * (settingsActive ? 1 : ambientMax)).toFixed(3);
     renderer.render(scene, camera);
   }
   function handleResize() {
@@ -32585,8 +32588,8 @@ void main() {
       window.addEventListener("resize", handleResize);
     },
     show() {
-      console.log("[Planet] show() - loaded:", loaded, "canvas:", !!planetCanvas);
       if (!loaded || !planetCanvas) return;
+      settingsActive = true;
       isActive = true;
       targetShow = 1;
       planetCanvas.style.display = "block";
@@ -32596,11 +32599,25 @@ void main() {
       if (usageCenter) usageCenter.style.opacity = "0";
     },
     hide() {
-      targetShow = 0;
+      settingsActive = false;
+      targetShow = ambient ? 1 : 0;
       const usageCenter = document.querySelector(".usage-center");
       if (usageCenter) {
         usageCenter.style.transition = "opacity 0.8s ease 0.3s";
         usageCenter.style.opacity = "1";
+      }
+    },
+    // Ambient backdrop mode (behind the multi-account cards)
+    setAmbient(on) {
+      if (!loaded || !planetCanvas) return;
+      ambient = !!on;
+      if (ambient) {
+        isActive = true;
+        targetShow = 1;
+        planetCanvas.style.display = "block";
+        if (!animFrameId) animate();
+      } else {
+        targetShow = settingsActive ? 1 : 0;
       }
     },
     get isActive() {

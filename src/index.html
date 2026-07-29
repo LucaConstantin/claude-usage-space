@@ -11,7 +11,6 @@
 </head>
 <body>
   <canvas id="starfield"></canvas>
-  <canvas id="planetCanvas" style="position:fixed;inset:0;z-index:1;display:none;pointer-events:none;opacity:0;"></canvas>
   <!-- Overlay for the session-history graph: never shaken by the beat -->
   <canvas id="overlayCanvas" style="position:fixed;inset:0;z-index:2;pointer-events:none;"></canvas>
 
@@ -51,6 +50,9 @@
   <!-- Main Usage Screen -->
   <div id="mainScreen" class="screen" style="display:none;">
 
+    <!-- Planet renders over the cards (behind controls); shown ambiently / in settings -->
+    <canvas id="planetCanvas" style="position:fixed;inset:0;z-index:6;display:none;pointer-events:none;opacity:0;"></canvas>
+
     <!-- Now Playing Widget - top left -->
     <div id="musicWidget" class="now-playing">
       <img id="musicArt" class="now-playing-art" src="" alt="" />
@@ -64,6 +66,9 @@
         <div class="now-playing-artist" id="musicArtist"></div>
       </div>
     </div>
+
+    <!-- Multi-account split view (hidden unless enabled) -->
+    <div id="multiView" class="multi-view" style="display:none;"></div>
 
     <div class="usage-center">
 

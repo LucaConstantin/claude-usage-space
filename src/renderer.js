@@ -39,6 +39,15 @@ let bassGlowEnabled = localStorage.getItem('bassGlowEnabled') !== 'false';
 // read them without hitting the temporal dead zone.
 let fontColor = localStorage.getItem('fontColor') || '#ffffff';
 let musicEnabled = localStorage.getItem('musicEnabled') === 'true';
+let insideShip = localStorage.getItem('insideShip') === 'true';  // metal interior background
+let settingsOpen = false;  // hide the history graph while the settings scene is up
+// Pointer parallax (used by the Inside Ship interior)
+let pointerTX = 0, pointerTY = 0;   // target (-1..1 from screen center)
+let pointerX = 0, pointerY = 0;     // smoothed
+window.addEventListener('mousemove', (e) => {
+  pointerTX = (e.clientX / window.innerWidth - 0.5) * 2;
+  pointerTY = (e.clientY / window.innerHeight - 0.5) * 2;
+});
 
 // ── Session history: peak utilization (%) of past 5h sessions ──
 let historyEnabled = localStorage.getItem('historyEnabled') !== 'false';
@@ -204,7 +213,77 @@ function updateStars() {
   }
 }
 
+// Minimal dark-metal "ship interior" with pointer parallax (depth layers)
+function drawInteriorBackground() {
+  // smooth the pointer toward its target
+  pointerX += (pointerTX - pointerX) * 0.06;
+  pointerY += (pointerTY - pointerY) * 0.06;
+  const px = pointerX, py = pointerY;
+
+  // ── Far wall (base gradient) ──
+  const g = ctx.createLinearGradient(0, 0, 0, viewH);
+  g.addColorStop(0, '#1b1d21');
+  g.addColorStop(1, '#0d0e10');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, viewW, viewH);
+
+  // moving metal sheen (opposite the pointer, gives a reflective feel)
+  const hx = viewW * 0.5 - px * 90;
+  const hy = viewH * 0.42 - py * 90;
+  const sheen = ctx.createRadialGradient(hx, hy, 0, hx, hy, Math.max(viewW, viewH) * 0.55);
+  sheen.addColorStop(0, 'rgba(255, 255, 255, 0.04)');
+  sheen.addColorStop(0.6, 'rgba(255, 255, 255, 0.012)');
+  sheen.addColorStop(1, 'rgba(255, 255, 255, 0)');
+  ctx.fillStyle = sheen;
+  ctx.fillRect(0, 0, viewW, viewH);
+
+  // ── Mid layer: panel seams (parallax ×18) ──
+  const oxM = -px * 18, oyM = -py * 18;
+  const seams = 4;
+  ctx.lineWidth = 1;
+  for (let i = 1; i < seams; i++) {
+    const y = Math.round((viewH / seams) * i + oyM) + 0.5;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.4)';
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(viewW, y); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.035)';
+    ctx.beginPath(); ctx.moveTo(0, y + 1.5); ctx.lineTo(viewW, y + 1.5); ctx.stroke();
+  }
+  const vx = [viewW * 0.16 + oxM, viewW * 0.84 + oxM];
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.32)';
+  for (const x of vx) {
+    const rx = Math.round(x) + 0.5;
+    ctx.beginPath(); ctx.moveTo(rx, 0); ctx.lineTo(rx, viewH); ctx.stroke();
+  }
+
+  // ── Near layer: rivets where seams cross (parallax ×30) ──
+  const oxN = -px * 30, oyN = -py * 30;
+  const rvx = [viewW * 0.16 + oxN, viewW * 0.84 + oxN];
+  for (let i = 1; i < seams; i++) {
+    const y = (viewH / seams) * i + oyN;
+    for (const x of rvx) {
+      ctx.beginPath(); ctx.arc(x, y, 2.4, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.5)'; ctx.fill();
+      ctx.beginPath(); ctx.arc(x - 0.6, y - 0.6, 1.1, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.09)'; ctx.fill();
+    }
+  }
+
+  // subtle edge vignette for depth
+  const vg = ctx.createRadialGradient(viewW / 2, viewH / 2, Math.min(viewW, viewH) * 0.3, viewW / 2, viewH / 2, Math.max(viewW, viewH) * 0.75);
+  vg.addColorStop(0, 'rgba(0, 0, 0, 0)');
+  vg.addColorStop(1, 'rgba(0, 0, 0, 0.4)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, viewW, viewH);
+}
+
 function drawStars() {
+  if (insideShip) {
+    // Simple metal interior instead of the starfield; corner glow still applies
+    drawInteriorBackground();
+    drawCornerGlow();
+    return;
+  }
+
   // ── Star layer → offscreen buffer with a partial fade, so stars leave a
   // motion-blur trail that lengthens as they accelerate on the beat. ──
   const trailFade = 0.2 + bassSmooth * 0.12;
@@ -271,21 +350,24 @@ function drawStars() {
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, viewW, viewH);
 
-  // Bass corner glow — crisp, on the main layer so it never trails
-  if (bassGlowEnabled && bassSmooth > 0.03) {
-    const bAlpha = bassSmooth * 0.18;
-    const gc = getGlowRGB();
-    const w = viewW, h = viewH;
-    const cornerRadius = Math.max(w, h) * 0.5;
-    const corners = [[0, 0], [w, 0], [0, h], [w, h]];
-    for (const [cx, cy] of corners) {
-      const cg2 = ctx.createRadialGradient(cx, cy, 0, cx, cy, cornerRadius);
-      cg2.addColorStop(0, `rgba(${gc.r}, ${gc.g}, ${gc.b}, ${bAlpha})`);
-      cg2.addColorStop(0.4, `rgba(${gc.r}, ${gc.g}, ${gc.b}, ${bAlpha * 0.3})`);
-      cg2.addColorStop(1, 'rgba(0, 0, 0, 0)');
-      ctx.fillStyle = cg2;
-      ctx.fillRect(0, 0, w, h);
-    }
+  drawCornerGlow();
+}
+
+// Bass corner glow — crisp, on the main layer so it never trails
+function drawCornerGlow() {
+  if (!bassGlowEnabled || bassSmooth <= 0.03) return;
+  const bAlpha = bassSmooth * 0.18;
+  const gc = getGlowRGB();
+  const w = viewW, h = viewH;
+  const cornerRadius = Math.max(w, h) * 0.5;
+  const corners = [[0, 0], [w, 0], [0, h], [w, h]];
+  for (const [cx, cy] of corners) {
+    const cg2 = ctx.createRadialGradient(cx, cy, 0, cx, cy, cornerRadius);
+    cg2.addColorStop(0, `rgba(${gc.r}, ${gc.g}, ${gc.b}, ${bAlpha})`);
+    cg2.addColorStop(0.4, `rgba(${gc.r}, ${gc.g}, ${gc.b}, ${bAlpha * 0.3})`);
+    cg2.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = cg2;
+    ctx.fillRect(0, 0, w, h);
   }
 }
 
@@ -634,7 +716,7 @@ function drawHistoryGraph() {
   // stays perfectly fixed. Clear it every frame (even when hidden).
   octx.clearRect(0, 0, viewW, viewH);
 
-  if (!historyEnabled) return;
+  if (!historyEnabled || settingsOpen) return;
   const data = sessionHistory.slice(-14);   // last N sessions, kept readable
   const n = data.length;
   if (n === 0) return;
@@ -808,7 +890,10 @@ let autoRefreshInterval = null;
 let isFetching = false;
 let showWeekly = localStorage.getItem('showWeekly') === 'true';
 let moneyMode = localStorage.getItem('moneyMode') === 'true';
-let tokensMode = localStorage.getItem('tokensMode') === 'true';
+let multiAccount = localStorage.getItem('multiAccount') === 'true';
+let accounts = [];        // [{ id, label, organizationId }]
+let multiUsage = [];      // last fetched per-account usage for the split view
+let acctTrack = {};       // id -> { last, peak } for detecting per-account session resets
 // musicEnabled is declared near the top (read early by the render loop)
 
 // Money mode state - accumulates across sessions
@@ -827,34 +912,15 @@ let moneyTickRunning = false;
 // plan-accurate ones once the subscription tier is detected.
 let plan = null;                          // { key, label, factor, tier } from the API
 const PRO_COST_PER_SESSION = 90;          // ~$ of real API compute for a full Pro session
-const PRO_TOKENS_PER_SESSION = 1000000;   // ~tokens of real compute for a full Pro session
 let COST_PER_SESSION = parseFloat(localStorage.getItem('costPerSession')) || PRO_COST_PER_SESSION;
 
-// ── Tokens mode state ──
-let TOKENS_PER_SESSION = parseFloat(localStorage.getItem('tokensPerSession')) || PRO_TOKENS_PER_SESSION;
-let tokensDirection = localStorage.getItem('tokensDirection') || 'remaining'; // 'remaining' | 'consumed'
-let displayedTokens = TOKENS_PER_SESSION;
-let targetTokens = TOKENS_PER_SESSION;
-let tokenBurn = 0;            // tokens/sec drain estimate between refreshes
-let tokensTickRunning = false;
-let lastTokenTick = 0;
-
-// Target token count for a given utilization %, honoring the chosen direction
-function tokensTargetFor(util) {
-  const u = Math.min(100, Math.max(0, util)) / 100;
-  return TOKENS_PER_SESSION * (tokensDirection === 'consumed' ? u : (1 - u));
-}
-
-// Apply a detected plan: auto-scale budgets to the tier unless the user set
-// their own values in settings.
+// Apply a detected plan: auto-scale the cost budget to the tier unless the user
+// set their own value in settings.
 function applyPlan(p) {
   if (!p || !p.factor) return;
   plan = p;
   if (!localStorage.getItem('costPerSession')) {
     COST_PER_SESSION = Math.round(PRO_COST_PER_SESSION * p.factor);
-  }
-  if (!localStorage.getItem('tokensPerSession')) {
-    TOKENS_PER_SESSION = Math.round(PRO_TOKENS_PER_SESSION * p.factor);
   }
 }
 
@@ -890,21 +956,28 @@ async function init() {
   }
   if (moneyMode) {
     applyMoneyMode();
-  } else if (tokensMode) {
-    applyTokensMode();
   }
   if (musicEnabled) {
     startMediaPolling();
     startAudioCapture();
   }
 
-  if (credentials.sessionKey && credentials.organizationId) {
+  accounts = await window.electronAPI.listAccounts();
+
+  if ((credentials.sessionKey && credentials.organizationId) || accounts.length) {
     showScreen('main');
-    await fetchUsageData();
+    applyMultiAccount(multiAccount);
+    await refreshUsage();
     startAutoRefresh();
   } else {
     showScreen('login');
   }
+}
+
+// Dispatch to the right fetch depending on the active view
+async function refreshUsage() {
+  if (multiAccount && accounts.length) return fetchAllUsageData();
+  return fetchUsageData();
 }
 
 function setupEvents() {
@@ -917,7 +990,7 @@ function setupEvents() {
 
   dom.refreshBtn.addEventListener('click', async () => {
     dom.refreshBtn.classList.add('spinning');
-    await fetchUsageData();
+    await refreshUsage();
     dom.refreshBtn.classList.remove('spinning');
   });
 
@@ -988,6 +1061,8 @@ let colorPopup = null;
 function applyFontColor(color) {
   fontColor = color;
   localStorage.setItem('fontColor', color);
+  // Cards follow the chosen color too
+  document.documentElement.style.setProperty('--card-accent', color);
   // Only apply if music theming isn't overriding
   if (!musicEnabled || !themeColor || !currentMedia || currentMedia.status !== 'Playing') {
     dom.sessionPct.style.color = color;
@@ -1023,8 +1098,7 @@ function getAccentRGB() {
 function applyFontSize(size) {
   fontSize = size;
   localStorage.setItem('fontSize', size);
-  const clamp = tokensMode ? 'clamp(40px, 8.5vw, 180px)'
-              : moneyMode ? 'clamp(64px, 12vw, 280px)'
+  const clamp = moneyMode ? 'clamp(64px, 12vw, 280px)'
               : 'clamp(72px, 14vw, 320px)';
   dom.sessionPct.style.fontSize = `calc(${size / 100} * ${clamp})`;
   document.documentElement.style.setProperty('--font-scale', size / 100);
@@ -1033,6 +1107,7 @@ function applyFontSize(size) {
 // Apply saved settings on startup
 setTimeout(() => {
   dom.sessionPct.style.color = fontColor;
+  document.documentElement.style.setProperty('--card-accent', fontColor);
   document.documentElement.style.setProperty('--font-scale', fontSize / 100);
   if (fontSize !== 100) applyFontSize(fontSize);
 }, 0);
@@ -1043,15 +1118,29 @@ setTimeout(() => {
 
 let settingsPopup = null;
 
+function openSettingsScene() {
+  settingsOpen = true;
+  if (window.PlanetScene) PlanetScene.show();   // planet ONLY appears in settings
+  const mv = document.getElementById('multiView');
+  if (mv) mv.style.display = 'none';            // hide cards → only the planet
+}
+
+function closeSettingsScene() {
+  settingsOpen = false;
+  if (window.PlanetScene) PlanetScene.hide();
+  const mv = document.getElementById('multiView');
+  if (mv && multiAccount && accounts.length) mv.style.display = 'flex';   // bring cards back
+}
+
 function toggleSettings() {
   if (settingsPopup) {
     settingsPopup.remove(); settingsPopup = null;
-    if (window.PlanetScene) PlanetScene.hide();
+    closeSettingsScene();
     return;
   }
 
-  // Show exploding planet when opening settings
-  if (window.PlanetScene) PlanetScene.show();
+  // Settings scene: only the planet visible; hide the cards/main content
+  openSettingsScene();
 
   const presets = ['#ffffff', '#f87171', '#fbbf24', '#34d399', '#60a5fa', '#a78bfa', '#f472b6', '#fb923c'];
   const glowPresets = ['#f87171', '#fbbf24', '#34d399', '#60a5fa', '#a78bfa', '#f472b6', '#fb923c'];
@@ -1065,9 +1154,28 @@ function toggleSettings() {
       <div class="settings-row"><span class="settings-label">Music Visualization</span><div class="toggle-switch${musicEnabled ? ' active' : ''}" data-toggle="music"></div></div>
       <div class="settings-row"><span class="settings-label">Bass Corner Glow</span><div class="toggle-switch${bassGlowEnabled ? ' active' : ''}" data-toggle="bassGlow"></div></div>
       <div class="settings-row"><span class="settings-label">Money Mode</span><div class="toggle-switch${moneyMode ? ' active' : ''}" data-toggle="money"></div></div>
-      <div class="settings-row"><span class="settings-label">Tokens Mode</span><div class="toggle-switch${tokensMode ? ' active' : ''}" data-toggle="tokens"></div></div>
-      <div class="settings-row"><span class="settings-label">Weekly View</span><div class="toggle-switch${showWeekly ? ' active' : ''}" data-toggle="weekly"></div></div>
       <div class="settings-row"><span class="settings-label">Usage History</span><div class="toggle-switch${historyEnabled ? ' active' : ''}" data-toggle="history"></div></div>
+    </div>
+
+    <div class="settings-section">
+      <div class="settings-title">Accounts</div>
+      <div class="settings-row"><span class="settings-label">Multi-Account (split)</span><div class="toggle-switch${multiAccount ? ' active' : ''}" data-toggle="multi"></div></div>
+      <div class="acct-manage">
+        ${accounts.length ? accounts.map(a => {
+          const info = accInfo(a.id);
+          const sc = info ? severityRGB(info.session) : null;
+          const dot = sc ? `rgb(${sc.r},${sc.g},${sc.b})` : 'rgba(255,255,255,0.2)';
+          return `<div class="acct-manage-row" data-id="${a.id}">
+            <div class="acct-row-top">
+              <span class="acct-dot" data-dot="${a.id}" style="background:${dot};color:${dot}"></span>
+              <input class="acct-name-input" data-id="${a.id}" value="${escapeHtml(a.label)}" spellcheck="false" maxlength="40" />
+              <button class="acct-remove" data-remove="${a.id}" title="Remove">&times;</button>
+            </div>
+            <div class="acct-row-detail" data-detail="${a.id}">${accDetailText(a.id)}</div>
+          </div>`;
+        }).join('') : '<div class="settings-hint" style="font-size:11px;color:rgba(255,255,255,0.35);">No accounts yet.</div>'}
+      </div>
+      <button class="add-account-btn" id="addAccountBtn">+ Add account</button>
     </div>
 
     <div class="settings-section">
@@ -1120,23 +1228,13 @@ function toggleSettings() {
     </div>`;
   }
 
-  if (tokensMode) {
-    html += `
-    <div class="settings-section">
-      <div class="settings-title">Tokens Config</div>
-      <div class="settings-row"><span class="settings-label">Count Up (used)</span><div class="toggle-switch${tokensDirection === 'consumed' ? ' active' : ''}" data-toggle="tokensDir"></div></div>
-      <div class="settings-row" style="gap:8px;">
-        <span class="settings-label" style="white-space:nowrap;">tokens/session</span>
-        <div class="color-hex-row" style="flex:1;">
-          <input type="number" class="color-hex-input tokens-input" value="${TOKENS_PER_SESSION}" min="1000" step="1000000" style="width:110px;" />
-          <button class="color-apply-btn tokens-apply">Set</button>
-        </div>
-      </div>
-      <div class="settings-hint" style="font-size:11px;color:rgba(255,255,255,0.35);margin-top:6px;">${plan ? `Auto-scaled to ${plan.label} (×${plan.factor}). ` : ''}Counts down from this budget as the session fills up.</div>
-    </div>`;
-  }
-
   html += `
+    <div class="settings-section">
+      <div class="settings-title">Environment</div>
+      <div class="settings-row"><span class="settings-label">Inside Ship</span><div class="toggle-switch${insideShip ? ' active' : ''}" data-toggle="insideShip"></div></div>
+      <div class="settings-hint" style="font-size:11px;color:rgba(255,255,255,0.35);margin-top:4px;">Swap the starfield for a plain dark-metal interior.</div>
+    </div>
+
     <div class="settings-section" style="border:none;margin:0;padding:0;">
       <div class="settings-actions">
         <button class="settings-action-btn" id="settingsFullscreen">Fullscreen</button>
@@ -1169,31 +1267,19 @@ function toggleSettings() {
       } else if (key === 'money') {
         moneyMode = on;
         localStorage.setItem('moneyMode', on);
-        if (on && tokensMode) { tokensMode = false; localStorage.setItem('tokensMode', false); stopTokensTick(); }
         applyMoneyMode();
         if (on) { targetMoney = totalMoney; displayedMoney = totalMoney; renderMoneyDisplay(); }
         // Rebuild popup to show/hide money config
         settingsPopup.remove(); settingsPopup = null; toggleSettings();
-      } else if (key === 'tokens') {
-        tokensMode = on;
-        localStorage.setItem('tokensMode', on);
-        if (on && moneyMode) { moneyMode = false; localStorage.setItem('moneyMode', false); stopMoneyTick(); }
-        applyTokensMode();
-        // Rebuild popup to show/hide tokens config
-        settingsPopup.remove(); settingsPopup = null; toggleSettings();
-      } else if (key === 'tokensDir') {
-        tokensDirection = on ? 'consumed' : 'remaining';
-        localStorage.setItem('tokensDirection', tokensDirection);
-        if (tokensMode) {
-          dom.usageLabel.textContent = tokensDirection === 'consumed' ? 'TOKENS USED' : 'TOKENS LEFT';
-          // recompute target; the tick lerps the flip smoothly
-          targetTokens = tokensTargetFor(usageData?.five_hour?.utilization || lastPct || 0);
-        }
-      } else if (key === 'weekly') {
-        showWeekly = on;
-        localStorage.setItem('showWeekly', on);
-        dom.weeklySection.style.display = on ? 'block' : 'none';
-        if (on && usageData) updateWeeklyUI();
+      } else if (key === 'multi') {
+        multiAccount = on;
+        localStorage.setItem('multiAccount', on);
+        applyMultiAccount(on);
+        refreshUsage();
+      } else if (key === 'insideShip') {
+        insideShip = on;
+        localStorage.setItem('insideShip', on);
+        updatePlanetAmbient();
       }
     });
   });
@@ -1268,22 +1354,79 @@ function toggleSettings() {
   const resetBtn = popup.querySelector('#settingsResetMoney');
   if (resetBtn) resetBtn.addEventListener('click', () => { settingsPopup.remove(); settingsPopup = null; showResetConfirm(); });
 
-  // ── Tokens config ──
-  const tokensApply = popup.querySelector('.tokens-apply');
-  if (tokensApply) {
-    const tokensInput = popup.querySelector('.tokens-input');
-    tokensApply.addEventListener('click', () => {
-      const val = parseFloat(tokensInput.value);
-      if (val > 0) {
-        TOKENS_PER_SESSION = val;
-        localStorage.setItem('tokensPerSession', val);
-        const util = usageData?.five_hour?.utilization || lastPct || 0;
-        targetTokens = tokensTargetFor(util);
-        displayedTokens = targetTokens;
-        if (tokensMode) renderTokensDisplay();
+  // ── Accounts management ──
+  const addBtn = popup.querySelector('#addAccountBtn');
+  if (addBtn) {
+    addBtn.addEventListener('click', async () => {
+      addBtn.disabled = true;
+      addBtn.textContent = 'Opening login…';
+      try {
+        const res = await window.electronAPI.addAccount();
+        if (res && res.success) {
+          accounts = await window.electronAPI.listAccounts();
+          settingsPopup.remove(); settingsPopup = null; toggleSettings();  // rebuild list, keep planet
+          refreshUsage();
+          return;
+        }
+        addBtn.textContent = (res && res.error) || 'Failed';
+      } catch (e) {
+        addBtn.textContent = 'Failed';
       }
+      addBtn.disabled = false;
+      setTimeout(() => { if (addBtn.isConnected) addBtn.textContent = '+ Add account'; }, 2500);
     });
-    tokensInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') tokensApply.click(); });
+  }
+  popup.querySelectorAll('.acct-remove').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.remove;
+      const res = await window.electronAPI.removeAccount(id);
+      accounts = (res && res.accounts) || await window.electronAPI.listAccounts();
+      settingsPopup.remove(); settingsPopup = null;
+      if (!accounts.length) {
+        credentials = { sessionKey: null, organizationId: null };
+        stopAutoRefresh();
+        showScreen('login');
+        return;
+      }
+      toggleSettings();
+      refreshUsage();
+    });
+  });
+  popup.querySelectorAll('.acct-name-input').forEach(input => {
+    const commit = async () => {
+      const id = input.dataset.id;
+      const label = input.value.trim();
+      if (!label) return;
+      const acc = accounts.find(a => a.id === id);
+      if (acc && acc.label === label) return;
+      if (acc) acc.label = label;
+      await window.electronAPI.renameAccount(id, label);
+      if (multiAccount) renderMultiView(multiUsage);
+    };
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') input.blur(); });
+  });
+
+  // Fetch fresh per-account details so each row shows plan + session/week %
+  if (accounts.length) {
+    (async () => {
+      try {
+        const list = await window.electronAPI.fetchAllUsage();
+        multiUsage = list;
+        if (!settingsPopup) return;
+        list.forEach(a => {
+          const detailEl = settingsPopup.querySelector(`.acct-row-detail[data-detail="${a.id}"]`);
+          const dotEl = settingsPopup.querySelector(`.acct-dot[data-dot="${a.id}"]`);
+          if (detailEl) detailEl.textContent = accDetailText(a.id, a.error);
+          const info = accInfo(a.id);
+          if (dotEl && info) {
+            const s = severityRGB(info.session);
+            dotEl.style.background = `rgb(${s.r},${s.g},${s.b})`;
+            dotEl.style.color = `rgb(${s.r},${s.g},${s.b})`;
+          }
+        });
+      } catch (e) {}
+    })();
   }
 
   // ── Actions ──
@@ -1291,6 +1434,7 @@ function toggleSettings() {
   popup.querySelector('#settingsLogout').addEventListener('click', async () => {
     await window.electronAPI.deleteCredentials();
     credentials = { sessionKey: null, organizationId: null };
+    accounts = [];
     stopAutoRefresh();
     if (countdownInterval) clearInterval(countdownInterval);
     showScreen('login');
@@ -1301,7 +1445,7 @@ function toggleSettings() {
   const closeHandler = (e) => {
     if (!popup.contains(e.target) && e.target !== dom.settingsBtn) {
       popup.remove(); settingsPopup = null;
-      if (window.PlanetScene) PlanetScene.hide();
+      closeSettingsScene();
       document.removeEventListener('click', closeHandler);
     }
   };
@@ -1366,6 +1510,23 @@ function recordSessionEnd() {
   localStorage.setItem('sessionPeak', '0');
 }
 
+// Per-account session tracking for the combined history graph (multi-account).
+// All accounts' past sessions land in the SAME sessionHistory timeline.
+function recordMultiSession(id, pct) {
+  let t = acctTrack[id];
+  if (!t) { acctTrack[id] = { last: pct, peak: pct }; return; } // first sighting — no false reset
+  if (pct < t.last - 10) {
+    if (t.peak >= 1) {
+      sessionHistory.push({ peak: Math.round(t.peak), t: Date.now(), acc: id });
+      if (sessionHistory.length > 60) sessionHistory = sessionHistory.slice(-60);
+      localStorage.setItem('sessionHistory', JSON.stringify(sessionHistory));
+    }
+    t.peak = pct;
+  }
+  t.peak = Math.max(t.peak, pct);
+  t.last = pct;
+}
+
 // Called when new usage data arrives - accumulates cost and recalculates burn rate
 function onNewUsageData(newPct) {
   const now = Date.now();
@@ -1400,14 +1561,9 @@ function onNewUsageData(newPct) {
     const elapsed = (now - lastPctTime) / 1000;
     const deltaPct = newPct - lastPct;
     burnRate = (deltaPct / 100 * COST_PER_SESSION) / elapsed;
-    tokenBurn = (deltaPct / 100 * TOKENS_PER_SESSION) / elapsed;
   } else if (newPct <= lastPct) {
     burnRate = 0;
-    tokenBurn = 0;
   }
-
-  // Tokens remaining/used = budget scaled by session progress (direction-aware)
-  targetTokens = tokensTargetFor(newPct);
 
   lastSessionPct = newPct;
   localStorage.setItem('lastSessionPct', lastSessionPct.toFixed(4));
@@ -1473,85 +1629,6 @@ function stopMoneyTick() {
 }
 
 // ═══════════════════════════════════════════════
-// Tokens Mode (session token budget draining toward 0)
-// ═══════════════════════════════════════════════
-
-function applyTokensMode() {
-  if (tokensMode) {
-    dom.sessionBarWrap.style.display = 'none';
-    dom.usageLabel.textContent = tokensDirection === 'consumed' ? 'TOKENS USED' : 'TOKENS LEFT';
-    const util = usageData?.five_hour?.utilization || lastPct || 0;
-    targetTokens = tokensTargetFor(util);
-    displayedTokens = targetTokens;
-    renderTokensDisplay();
-    startTokensTick();
-  } else {
-    dom.sessionBarWrap.style.display = '';
-    dom.usageLabel.textContent = 'CURRENT SESSION';
-    stopTokensTick();
-    if (usageData) updateSessionUI();
-  }
-  if (fontSize !== 100) applyFontSize(fontSize);
-}
-
-function renderTokensDisplay() {
-  const val = Math.max(0, Math.round(displayedTokens));
-  const str = val.toLocaleString('en-US');
-
-  let html = '';
-  for (const ch of str) {
-    if (ch >= '0' && ch <= '9') html += `<span class="money-digit">${ch}</span>`;
-    else html += `<span class="money-sep">${ch}</span>`;
-  }
-  html += `<span class="tokens-unit">tok</span>`;
-
-  dom.sessionPct.innerHTML = html;
-  dom.sessionPct.className = 'usage-pct money-mode tokens-mode';
-}
-
-function tokensTick(now) {
-  if (!tokensTickRunning) return;
-
-  if (lastTokenTick > 0) {
-    const dt = (now - lastTokenTick) / 1000;
-    if (dt < 2) {
-      // Continuously move toward the limit between refreshes at the estimated
-      // rate — draining toward 0, or filling toward the budget if counting up.
-      if (tokenBurn > 0) {
-        if (tokensDirection === 'consumed') {
-          targetTokens = Math.min(TOKENS_PER_SESSION, targetTokens + tokenBurn * dt);
-        } else {
-          targetTokens = Math.max(0, targetTokens - tokenBurn * dt);
-        }
-      }
-      // Smooth lerp toward the target
-      const diff = targetTokens - displayedTokens;
-      if (Math.abs(diff) > 0.5) {
-        displayedTokens += diff * (1 - Math.exp(-LERP_SPEED * dt));
-        renderTokensDisplay();
-      } else if (displayedTokens !== targetTokens) {
-        displayedTokens = targetTokens;
-        renderTokensDisplay();
-      }
-    }
-  }
-  lastTokenTick = now;
-  requestAnimationFrame(tokensTick);
-}
-
-function startTokensTick() {
-  if (tokensTickRunning) return;
-  tokensTickRunning = true;
-  lastTokenTick = 0;
-  requestAnimationFrame(tokensTick);
-}
-
-function stopTokensTick() {
-  tokensTickRunning = false;
-  lastTokenTick = 0;
-}
-
-// ═══════════════════════════════════════════════
 // Auth
 // ═══════════════════════════════════════════════
 
@@ -1573,8 +1650,10 @@ async function handleAutoDetect() {
     if (validation.success) {
       credentials = { sessionKey: result.sessionKey, organizationId: validation.organizationId };
       await window.electronAPI.saveCredentials(credentials);
+      accounts = await window.electronAPI.listAccounts();
       showScreen('main');
-      await fetchUsageData();
+      applyMultiAccount(multiAccount);
+      await refreshUsage();
       startAutoRefresh();
     } else {
       dom.autoDetectError.textContent = 'Session invalid. Try again.';
@@ -1600,9 +1679,11 @@ async function handleConnect() {
     if (result.success) {
       credentials = { sessionKey: key, organizationId: result.organizationId };
       await window.electronAPI.saveCredentials(credentials);
+      accounts = await window.electronAPI.listAccounts();
       dom.sessionKeyInput.value = '';
       showScreen('main');
-      await fetchUsageData();
+      applyMultiAccount(multiAccount);
+      await refreshUsage();
       startAutoRefresh();
     } else {
       dom.sessionKeyError.textContent = result.error || 'Invalid session key';
@@ -1640,7 +1721,7 @@ async function fetchUsageData() {
       // Always update timers (resets_at / countdown)
       updateTimers();
 
-      if (!moneyMode && !tokensMode) {
+      if (!moneyMode) {
         updateSessionUI();
       }
 
@@ -1672,13 +1753,194 @@ function startAutoRefresh() {
   stopAutoRefresh();
   autoRefreshInterval = setInterval(async () => {
     dom.refreshBtn.classList.add('spinning');
-    await fetchUsageData();
+    await refreshUsage();
     dom.refreshBtn.classList.remove('spinning');
   }, REFRESH_MS);
 }
 
 function stopAutoRefresh() {
   if (autoRefreshInterval) { clearInterval(autoRefreshInterval); autoRefreshInterval = null; }
+}
+
+// ═══════════════════════════════════════════════
+// Multi-Account Split View
+// ═══════════════════════════════════════════════
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Per-account snapshot (plan + session/week %) from the last multi fetch
+function accInfo(id) {
+  const a = multiUsage.find(x => x.id === id);
+  if (!a || !a.ok || !a.data) return null;
+  const d = a.data;
+  return {
+    plan: d.plan?.label || '',
+    session: Math.round(d.five_hour?.utilization || 0),
+    week: Math.round(d.seven_day?.utilization || 0)
+  };
+}
+
+function accDetailText(id, err) {
+  const info = accInfo(id);
+  if (info) return `${info.plan ? info.plan + ' · ' : ''}session ${info.session}% · week ${info.week}%`;
+  return err === 'SessionExpired' ? 'session expired — reconnect' : 'loading…';
+}
+
+// Smooth severity color: calm green → lime → amber → orange → red as usage climbs
+function severityRGB(pct) {
+  const stops = [
+    { p: 0,   c: [52, 211, 153] },   // emerald
+    { p: 55,  c: [163, 230, 53] },   // lime
+    { p: 75,  c: [251, 191, 36] },   // amber
+    { p: 90,  c: [251, 146, 60] },   // orange
+    { p: 100, c: [248, 113, 113] }   // red
+  ];
+  const v = Math.max(0, Math.min(100, pct));
+  let a = stops[0], b = stops[stops.length - 1];
+  for (let i = 0; i < stops.length - 1; i++) {
+    if (v >= stops[i].p && v <= stops[i + 1].p) { a = stops[i]; b = stops[i + 1]; break; }
+  }
+  const t = b.p === a.p ? 0 : (v - a.p) / (b.p - a.p);
+  return {
+    r: Math.round(a.c[0] + (b.c[0] - a.c[0]) * t),
+    g: Math.round(a.c[1] + (b.c[1] - a.c[1]) * t),
+    b: Math.round(a.c[2] + (b.c[2] - a.c[2]) * t)
+  };
+}
+
+function applyMultiAccount(on) {
+  multiAccount = on;
+  const mv = document.getElementById('multiView');
+  const uc = document.querySelector('.usage-center');
+  if (on && accounts.length) {
+    if (uc) uc.style.display = 'none';
+    if (mv) mv.style.display = 'flex';
+  } else {
+    if (mv) mv.style.display = 'none';
+    if (uc) uc.style.display = '';
+  }
+  updatePlanetAmbient();
+}
+
+// Planet appears ONLY in the settings scene now — keep ambient mode off
+function updatePlanetAmbient() {
+  if (window.PlanetScene && PlanetScene.setAmbient) PlanetScene.setAmbient(false);
+}
+
+async function fetchAllUsageData() {
+  if (isFetching) return;
+  isFetching = true;
+  dom.statusLine.textContent = 'Fetching...';
+  dom.statusLine.style.opacity = '1';
+  try {
+    multiUsage = await window.electronAPI.fetchAllUsage();
+    // Record each account's session peaks into the shared history timeline
+    for (const a of multiUsage) {
+      if (a.ok && a.data) recordMultiSession(a.id, Math.round(a.data.five_hour?.utilization || 0));
+    }
+    renderMultiView(multiUsage);
+    startCountdown();
+    autoEnrichNames();
+    const now = new Date();
+    dom.statusLine.textContent = `Updated ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+    setTimeout(() => { dom.statusLine.style.opacity = '0.3'; }, 2000);
+  } catch (e) {
+    dom.statusLine.textContent = 'Failed to fetch';
+  }
+  isFetching = false;
+}
+
+// Replace default "Account N" labels with the real name from the Claude account
+async function autoEnrichNames() {
+  const defaults = accounts.filter(a => /^Account \d+$/.test(a.label));
+  if (!defaults.length) return;
+  let changed = false;
+  for (const a of defaults) {
+    try {
+      const res = await window.electronAPI.enrichAccountName(a.id);
+      if (res && res.success && res.label) { a.label = res.label; changed = true; }
+    } catch (e) {}
+  }
+  if (changed) renderMultiView(multiUsage);
+}
+
+// Build a card once; values are patched in place on refresh (no flicker)
+function cardSkeleton(a) {
+  return `<div class="acct-card" data-id="${a.id}">
+      <div class="acct-label"><span class="acct-name">${escapeHtml(a.label)}</span><span class="acct-plan"></span></div>
+      <div class="acct-pct">&mdash;</div>
+      <div class="acct-bar"><div class="acct-bar-fill"></div></div>
+      <div class="acct-meta">
+        <div class="acct-meta-row"><span>Session resets</span><b class="acct-cd acct-scd" data-resets="">&mdash;</b></div>
+        <div class="acct-meta-row"><span>Week</span><b class="acct-wk">&mdash;</b></div>
+        <div class="acct-meta-row"><span>Week resets</span><b class="acct-cd acct-wcd" data-resets="">&mdash;</b></div>
+      </div>
+    </div>`;
+}
+
+function updateCard(mv, a) {
+  const card = mv.querySelector(`.acct-card[data-id="${a.id}"]`);
+  if (!card) return;
+  const nameEl = card.querySelector('.acct-name');
+  if (nameEl) nameEl.textContent = a.label;
+
+  if (!a.ok || !a.data) {
+    card.classList.add('error');
+    const pctEl = card.querySelector('.acct-pct');
+    pctEl.className = 'acct-pct';
+    pctEl.textContent = a.error === 'SessionExpired' ? 'Session expired' : 'Unavailable';
+    card.querySelector('.acct-plan').textContent = '';
+    card.querySelector('.acct-scd').textContent = '—';
+    card.querySelector('.acct-wk').textContent = '—';
+    card.querySelector('.acct-wcd').textContent = '—';
+    return;
+  }
+  card.classList.remove('error');
+  const d = a.data;
+  const pct = Math.round(d.five_hour?.utilization || 0);
+  const wk = Math.round(d.seven_day?.utilization || 0);
+  const sReset = d.five_hour?.resets_at || '';
+  const wReset = d.seven_day?.resets_at || '';
+
+  card.querySelector('.acct-plan').textContent = d.plan?.label ? ` · ${d.plan.label}` : '';
+
+  // Intelligent severity color for the session percentage + bar
+  const sc = severityRGB(pct);
+  const pctEl = card.querySelector('.acct-pct');
+  pctEl.textContent = `${pct}%`;
+  pctEl.className = 'acct-pct';
+  pctEl.style.color = `rgb(${sc.r}, ${sc.g}, ${sc.b})`;
+  const bar = card.querySelector('.acct-bar-fill');
+  bar.style.width = Math.min(pct, 100) + '%';
+  bar.className = 'acct-bar-fill';
+  bar.style.background = `rgba(${sc.r}, ${sc.g}, ${sc.b}, 0.8)`;
+  bar.style.boxShadow = `0 0 16px rgba(${sc.r}, ${sc.g}, ${sc.b}, 0.25)`;
+
+  const scd = card.querySelector('.acct-scd'); scd.dataset.resets = sReset; scd.textContent = formatCountdown(sReset);
+  const wkEl = card.querySelector('.acct-wk');
+  const wc = severityRGB(wk);
+  wkEl.textContent = `${wk}%`;
+  wkEl.style.color = `rgb(${wc.r}, ${wc.g}, ${wc.b})`;
+  const wcd = card.querySelector('.acct-wcd'); wcd.dataset.resets = wReset; wcd.textContent = formatCountdown(wReset);
+}
+
+function renderMultiView(list) {
+  const mv = document.getElementById('multiView');
+  if (!mv) return;
+  if (!list || !list.length) {
+    mv.dataset.ids = '';
+    mv.innerHTML = '<div class="acct-card error"><div class="acct-label"><span class="acct-name">No accounts</span></div><div class="acct-meta"><div class="acct-meta-row"><span>Add one in settings</span></div></div></div>';
+    return;
+  }
+  const ids = list.map(a => a.id).join(',');
+  if (mv.dataset.ids !== ids) {
+    mv.dataset.ids = ids;
+    mv.innerHTML = list.map(cardSkeleton).join('');
+  }
+  list.forEach(a => updateCard(mv, a));
 }
 
 // ═══════════════════════════════════════════════
@@ -1778,6 +2040,13 @@ function formatCountdown(resetsAt) {
 }
 
 function updateCountdowns() {
+  // Multi-account cards keep their own live countdowns
+  if (multiAccount) {
+    document.querySelectorAll('.acct-cd').forEach(el => {
+      if (el.dataset.resets) el.textContent = formatCountdown(el.dataset.resets);
+    });
+  }
+
   if (!usageData) return;
 
   dom.sessionCountdown.textContent = formatCountdown(usageData.five_hour?.resets_at);

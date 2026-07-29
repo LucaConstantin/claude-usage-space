@@ -28,6 +28,109 @@ async function setSessionCookie(sessionKey) {
   });
 }
 
+// ═══════════════════════════════════════════════
+// Multi-account support (isolated cookie jars per account)
+// ═══════════════════════════════════════════════
+
+function partitionFor(id) { return `persist:acct_${id}`; }
+
+function sessionFor(id) {
+  const sess = session.fromPartition(partitionFor(id));
+  sess.setUserAgent(CHROME_USER_AGENT);
+  return sess;
+}
+
+async function setCookieOn(sess, sessionKey) {
+  await sess.cookies.set({
+    url: 'https://claude.ai', name: 'sessionKey', value: sessionKey,
+    domain: '.claude.ai', path: '/', secure: true, httpOnly: true
+  });
+}
+
+function saveAccountKey(id, key) {
+  if (safeStorage.isEncryptionAvailable()) {
+    store.set(`acctKey_${id}`, safeStorage.encryptString(key).toString('base64'));
+    store.delete(`acctKeyPlain_${id}`);
+  } else {
+    store.set(`acctKeyPlain_${id}`, key);
+  }
+}
+
+function getAccountKey(id) {
+  if (safeStorage.isEncryptionAvailable()) {
+    const enc = store.get(`acctKey_${id}`);
+    if (enc) { try { return safeStorage.decryptString(Buffer.from(enc, 'base64')); } catch (e) {} }
+  }
+  return store.get(`acctKeyPlain_${id}`) || null;
+}
+
+function getLegacyKey() {
+  if (safeStorage.isEncryptionAvailable()) {
+    const enc = store.get('sessionKey_encrypted');
+    if (enc) { try { return safeStorage.decryptString(Buffer.from(enc, 'base64')); } catch (e) {} }
+  }
+  return store.get('sessionKey') || null;
+}
+
+// Returns the account list, migrating a legacy single-account setup on first use.
+function getAccounts() {
+  let accounts = store.get('accounts');
+  if (accounts && accounts.length) return accounts;
+  const orgId = store.get('organizationId');
+  const legacy = getLegacyKey();
+  if (orgId && legacy) {
+    saveAccountKey('primary', legacy);
+    accounts = [{ id: 'primary', label: 'Account 1', organizationId: orgId }];
+    store.set('accounts', accounts);
+    return accounts;
+  }
+  return [];
+}
+
+// Shared usage fetch (usage + overage + prepaid + plan) for a given partition/org
+async function fetchUsageBundle(partition, organizationId) {
+  const usageUrl = `https://claude.ai/api/organizations/${organizationId}/usage`;
+  const overageUrl = `https://claude.ai/api/organizations/${organizationId}/overage_spend_limit`;
+  const prepaidUrl = `https://claude.ai/api/organizations/${organizationId}/prepaid/credits`;
+  const orgsUrl = `https://claude.ai/api/organizations`;
+
+  let data;
+  try {
+    const results = await fetchMultipleViaWindow([usageUrl, overageUrl, prepaidUrl, orgsUrl], { partition });
+    data = results[0];
+    const overage = results[1];
+    const prepaid = results[2];
+    const orgs = results[3];
+
+    data.plan = detectPlan(orgs, organizationId);
+
+    if (overage) {
+      const limit = overage.monthly_credit_limit ?? overage.spend_limit_amount_cents;
+      const used = overage.used_credits ?? overage.balance_cents;
+      const enabled = overage.is_enabled !== undefined ? overage.is_enabled : (limit != null);
+      if (enabled && typeof limit === 'number' && typeof used === 'number') {
+        data.spending = { used_cents: used, limit_cents: limit, is_enabled: true, currency: overage.currency || 'USD' };
+      } else {
+        data.spending = { is_enabled: false, currency: overage.currency || 'USD' };
+      }
+    }
+    if (prepaid && typeof prepaid.amount === 'number') {
+      if (!data.spending) data.spending = {};
+      data.spending.balance_cents = prepaid.amount;
+      if (!data.spending.currency && prepaid.currency) data.spending.currency = prepaid.currency;
+    }
+  } catch (err) {
+    data = await fetchViaWindow(usageUrl, { partition });
+  }
+
+  if (!data || data.error) {
+    const msg = data?.error?.message || data?.error || 'Unknown error';
+    if (msg.includes('Cloudflare') || msg.includes('Unauthorized')) throw new Error('SessionExpired');
+    throw new Error(msg);
+  }
+  return data;
+}
+
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -86,7 +189,7 @@ ipcMain.handle('get-credentials', () => {
   };
 });
 
-// IPC: Save credentials
+// IPC: Save credentials (primary account)
 ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId }) => {
   if (safeStorage.isEncryptionAvailable()) {
     const encrypted = safeStorage.encryptString(sessionKey);
@@ -99,11 +202,33 @@ ipcMain.handle('save-credentials', async (event, { sessionKey, organizationId })
     store.set('organizationId', organizationId);
   }
   await setSessionCookie(sessionKey);
+
+  // Upsert into the accounts model as the primary account
+  let accounts = store.get('accounts') || [];
+  if (!accounts.length) {
+    accounts = [{ id: 'primary', label: 'Account 1', organizationId }];
+  } else if (organizationId) {
+    accounts[0].organizationId = organizationId;
+  }
+  saveAccountKey(accounts[0].id, sessionKey);
+  await setCookieOn(sessionFor(accounts[0].id), sessionKey);
+  store.set('accounts', accounts);
   return true;
 });
 
-// IPC: Delete credentials
+// IPC: Delete ALL credentials / accounts (full logout)
 ipcMain.handle('delete-credentials', async () => {
+  const accounts = getAccounts();
+  for (const acc of accounts) {
+    store.delete(`acctKey_${acc.id}`);
+    store.delete(`acctKeyPlain_${acc.id}`);
+    try {
+      const sess = session.fromPartition(partitionFor(acc.id));
+      const cookies = await sess.cookies.get({ url: 'https://claude.ai' });
+      for (const c of cookies) await sess.cookies.remove('https://claude.ai', c.name);
+    } catch (e) {}
+  }
+  store.delete('accounts');
   store.delete('sessionKey');
   store.delete('sessionKey_encrypted');
   store.delete('organizationId');
@@ -183,83 +308,138 @@ ipcMain.handle('detect-session-key', async () => {
   });
 });
 
-// IPC: Fetch usage data + spending info
+// IPC: Fetch usage data for the primary account (single-view / backward compat)
 ipcMain.handle('fetch-usage-data', async () => {
-  let sessionKey = null;
-  if (safeStorage.isEncryptionAvailable()) {
-    const encrypted = store.get('sessionKey_encrypted');
-    if (encrypted) {
+  const accounts = getAccounts();
+  if (!accounts.length) throw new Error('Missing credentials');
+  const acc = accounts[0];
+  const key = getAccountKey(acc.id);
+  if (!key || !acc.organizationId) throw new Error('Missing credentials');
+  await setCookieOn(sessionFor(acc.id), key);
+  return await fetchUsageBundle(partitionFor(acc.id), acc.organizationId);
+});
+
+// IPC: List accounts (no secrets)
+ipcMain.handle('list-accounts', () =>
+  getAccounts().map(a => ({ id: a.id, label: a.label, organizationId: a.organizationId })));
+
+// IPC: Fetch usage for every account (multi-account split view)
+ipcMain.handle('fetch-all-usage', async () => {
+  const accounts = getAccounts();
+  const out = [];
+  for (const acc of accounts) {
+    try {
+      const key = getAccountKey(acc.id);
+      if (!key || !acc.organizationId) { out.push({ id: acc.id, label: acc.label, ok: false, error: 'Missing credentials' }); continue; }
+      await setCookieOn(sessionFor(acc.id), key);
+      const data = await fetchUsageBundle(partitionFor(acc.id), acc.organizationId);
+      out.push({ id: acc.id, label: acc.label, ok: true, data });
+    } catch (e) {
+      out.push({ id: acc.id, label: acc.label, ok: false, error: (e && e.message) || 'error' });
+    }
+  }
+  return out;
+});
+
+// IPC: Add a new account — logs in on an isolated session partition
+ipcMain.handle('add-account', async () => {
+  const id = 'a' + Date.now().toString(36);
+  const partition = partitionFor(id);
+  const sess = sessionFor(id);
+  try { await sess.cookies.remove('https://claude.ai', 'sessionKey'); } catch (e) {}
+
+  const sessionKey = await new Promise((resolve) => {
+    const loginWin = new BrowserWindow({
+      width: 1000, height: 700, title: 'Add Claude Account',
+      webPreferences: { nodeIntegration: false, contextIsolation: true, partition }
+    });
+    let resolved = false;
+    const allowed = ['claude.ai', 'accounts.google.com', 'appleid.apple.com', 'login.microsoftonline.com'];
+    loginWin.webContents.on('will-navigate', (event, url) => {
       try {
-        sessionKey = safeStorage.decryptString(Buffer.from(encrypted, 'base64'));
-      } catch (err) {}
-    }
-  } else {
-    sessionKey = store.get('sessionKey');
-  }
-  const organizationId = store.get('organizationId');
-
-  if (!sessionKey || !organizationId) throw new Error('Missing credentials');
-
-  await setSessionCookie(sessionKey);
-
-  const usageUrl = `https://claude.ai/api/organizations/${organizationId}/usage`;
-  const overageUrl = `https://claude.ai/api/organizations/${organizationId}/overage_spend_limit`;
-  const prepaidUrl = `https://claude.ai/api/organizations/${organizationId}/prepaid/credits`;
-  const orgsUrl = `https://claude.ai/api/organizations`;
-
-  let data;
-  try {
-    const results = await fetchMultipleViaWindow([usageUrl, overageUrl, prepaidUrl, orgsUrl]);
-    data = results[0];
-    const overage = results[1];
-    const prepaid = results[2];
-    const orgs = results[3];
-
-    // Detect the subscription plan (Pro / Max 5x / Max 20x / …) so the renderer
-    // can scale its token/cost estimates to the user's actual tier.
-    data.plan = detectPlan(orgs, organizationId);
-
-    // Merge overage spending data
-    if (overage) {
-      const limit = overage.monthly_credit_limit ?? overage.spend_limit_amount_cents;
-      const used = overage.used_credits ?? overage.balance_cents;
-      const enabled = overage.is_enabled !== undefined ? overage.is_enabled : (limit != null);
-
-      if (enabled && typeof limit === 'number' && typeof used === 'number') {
-        data.spending = {
-          used_cents: used,
-          limit_cents: limit,
-          is_enabled: true,
-          currency: overage.currency || 'USD'
-        };
-      } else {
-        data.spending = { is_enabled: false, currency: overage.currency || 'USD' };
+        const h = new URL(url).hostname;
+        if (!allowed.some(d => h === d || h.endsWith('.' + d))) event.preventDefault();
+      } catch { event.preventDefault(); }
+    });
+    const onChanged = (event, cookie, cause, removed) => {
+      if (cookie.name === 'sessionKey' && cookie.domain.includes('claude.ai') && !removed && cookie.value) {
+        resolved = true;
+        sess.cookies.removeListener('changed', onChanged);
+        loginWin.close();
+        resolve(cookie.value);
       }
-    }
+    };
+    sess.cookies.on('changed', onChanged);
+    loginWin.on('closed', () => {
+      sess.cookies.removeListener('changed', onChanged);
+      if (!resolved) resolve(null);
+    });
+    loginWin.loadURL('https://claude.ai/login');
+  });
 
-    // Merge prepaid balance
-    if (prepaid && typeof prepaid.amount === 'number') {
-      if (!data.spending) data.spending = {};
-      data.spending.balance_cents = prepaid.amount;
-      if (!data.spending.currency && prepaid.currency) data.spending.currency = prepaid.currency;
-    }
-  } catch (err) {
-    // If batch fails, try usage alone
-    data = await fetchViaWindow(usageUrl);
+  if (!sessionKey) return { success: false, error: 'Login window closed' };
+
+  try {
+    await setCookieOn(sess, sessionKey);
+    const orgsData = await fetchViaWindow('https://claude.ai/api/organizations', { partition });
+    if (!Array.isArray(orgsData) || orgsData.length === 0) return { success: false, error: 'No organization found' };
+    const chatOrgs = orgsData.filter(o => o.capabilities && o.capabilities.includes('chat'));
+    if (chatOrgs.length === 0) return { success: false, error: 'No chat-enabled organizations found' };
+    const defaultOrg = chatOrgs.find(o => o.raven_type === 'team') || chatOrgs[0];
+    const orgId = defaultOrg.uuid || defaultOrg.id;
+
+    saveAccountKey(id, sessionKey);
+    const accounts = getAccounts();
+    let label = `Account ${accounts.length + 1}`;
+    try {
+      const boot = await fetchViaWindow('https://claude.ai/api/bootstrap', { partition });
+      const name = boot?.account?.display_name || boot?.account?.full_name || boot?.account?.email_address;
+      if (name) label = name;
+    } catch (e) {}
+    accounts.push({ id, label, organizationId: orgId });
+    store.set('accounts', accounts);
+    return { success: true, account: { id, label, organizationId: orgId } };
+  } catch (e) {
+    return { success: false, error: (e && e.message) || 'Validation failed' };
   }
+});
 
-  // Check for blocked responses
-  if (!data || data.error) {
-    const msg = data?.error?.message || data?.error || 'Unknown error';
-    if (msg.includes('Cloudflare') || msg.includes('Unauthorized')) {
-      store.delete('sessionKey');
-      store.delete('organizationId');
-      throw new Error('SessionExpired');
-    }
-    throw new Error(msg);
-  }
+// IPC: Remove an account
+ipcMain.handle('remove-account', async (event, id) => {
+  const accounts = getAccounts().filter(a => a.id !== id);
+  store.set('accounts', accounts);
+  store.delete(`acctKey_${id}`);
+  store.delete(`acctKeyPlain_${id}`);
+  try {
+    const sess = session.fromPartition(partitionFor(id));
+    const cookies = await sess.cookies.get({ url: 'https://claude.ai' });
+    for (const c of cookies) await sess.cookies.remove('https://claude.ai', c.name);
+  } catch (e) {}
+  return { success: true, accounts: accounts.map(a => ({ id: a.id, label: a.label, organizationId: a.organizationId })) };
+});
 
-  return data;
+// IPC: Rename an account
+ipcMain.handle('rename-account', (event, { id, label }) => {
+  const accounts = getAccounts();
+  const a = accounts.find(x => x.id === id);
+  if (a) { a.label = label; store.set('accounts', accounts); }
+  return { success: true, accounts: accounts.map(x => ({ id: x.id, label: x.label, organizationId: x.organizationId })) };
+});
+
+// IPC: Fetch the real Claude account name for an account (for default labels)
+ipcMain.handle('enrich-account-name', async (event, id) => {
+  const accounts = getAccounts();
+  const acc = accounts.find(a => a.id === id);
+  if (!acc) return { success: false };
+  const key = getAccountKey(id);
+  if (!key) return { success: false };
+  try {
+    await setCookieOn(sessionFor(id), key);
+    const boot = await fetchViaWindow('https://claude.ai/api/bootstrap', { partition: partitionFor(id) });
+    const name = boot?.account?.display_name || boot?.account?.full_name || boot?.account?.email_address;
+    if (name) { acc.label = name; store.set('accounts', accounts); return { success: true, label: name }; }
+  } catch (e) {}
+  return { success: false };
 });
 
 // Derive the subscription plan + a usage multiplier relative to Pro (×1),
