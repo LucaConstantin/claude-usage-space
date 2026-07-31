@@ -15,6 +15,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   enrichAccountName: (id) => ipcRenderer.invoke('enrich-account-name', id),
   toggleFullscreen: () => ipcRenderer.send('toggle-fullscreen'),
   isFullscreen: () => ipcRenderer.invoke('is-fullscreen'),
+  getLaunchAtLogin: () => ipcRenderer.invoke('get-launch-at-login'),
+  setLaunchAtLogin: (v) => ipcRenderer.invoke('set-launch-at-login', v),
   quitApp: () => ipcRenderer.send('quit-app'),
   getMediaInfo: () => ipcRenderer.invoke('get-media-info'),
   fetchAlbumArt: (title, artist) => ipcRenderer.invoke('fetch-album-art', title, artist)

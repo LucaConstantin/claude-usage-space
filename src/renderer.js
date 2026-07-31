@@ -41,6 +41,7 @@ let fontColor = localStorage.getItem('fontColor') || '#ffffff';
 let musicEnabled = localStorage.getItem('musicEnabled') === 'true';
 let insideShip = localStorage.getItem('insideShip') === 'true';  // metal interior background
 let settingsOpen = false;  // hide the history graph while the settings scene is up
+let launchAtLogin = false; // starts with Windows (read from the OS on init)
 // Pointer parallax (used by the Inside Ship interior)
 let pointerTX = 0, pointerTY = 0;   // target (-1..1 from screen center)
 let pointerX = 0, pointerY = 0;     // smoothed
@@ -963,6 +964,7 @@ async function init() {
   }
 
   accounts = await window.electronAPI.listAccounts();
+  try { launchAtLogin = await window.electronAPI.getLaunchAtLogin(); } catch (e) {}
 
   if ((credentials.sessionKey && credentials.organizationId) || accounts.length) {
     showScreen('main');
@@ -1233,6 +1235,7 @@ function toggleSettings() {
       <div class="settings-title">Environment</div>
       <div class="settings-row"><span class="settings-label">Inside Ship</span><div class="toggle-switch${insideShip ? ' active' : ''}" data-toggle="insideShip"></div></div>
       <div class="settings-hint" style="font-size:11px;color:rgba(255,255,255,0.35);margin-top:4px;">Swap the starfield for a plain dark-metal interior.</div>
+      <div class="settings-row" style="margin-top:10px;"><span class="settings-label">Start with Windows</span><div class="toggle-switch${launchAtLogin ? ' active' : ''}" data-toggle="launchLogin"></div></div>
     </div>
 
     <div class="settings-section" style="border:none;margin:0;padding:0;">
@@ -1280,6 +1283,9 @@ function toggleSettings() {
         insideShip = on;
         localStorage.setItem('insideShip', on);
         updatePlanetAmbient();
+      } else if (key === 'launchLogin') {
+        launchAtLogin = on;
+        window.electronAPI.setLaunchAtLogin(on);
       }
     });
   });

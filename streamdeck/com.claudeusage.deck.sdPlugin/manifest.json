@@ -1,0 +1,28 @@
+{
+  "SDKVersion": 2,
+  "Version": "1.0.0",
+  "Author": "Claude Usage Space",
+  "Name": "Claude Usage Deck",
+  "Description": "Fills your Stream Deck with your Claude usage — one column per account (name, 5h session %, weekly %, reset timers). Empty keys run a starfield screensaver. Requires Claude Usage Space running.",
+  "Category": "Claude Usage",
+  "CategoryIcon": "icons/plugin",
+  "Icon": "icons/plugin",
+  "URL": "https://github.com/LucaConstantin/claude-usage-space",
+  "CodePath": "plugin.html",
+  "Software": { "MinimumVersion": "6.0" },
+  "OS": [
+    { "Platform": "windows", "MinimumVersion": "10" },
+    { "Platform": "mac", "MinimumVersion": "10.15" }
+  ],
+  "Actions": [
+    {
+      "UUID": "com.claudeusage.deck.tile",
+      "Name": "Usage Tile",
+      "Icon": "icons/action",
+      "Tooltip": "One tile of the Claude usage layout. Auto-arranges by its position on the deck.",
+      "PropertyInspectorPath": "pi.html",
+      "SupportedInMultiActions": false,
+      "States": [ { "Image": "icons/key", "TitleAlignment": "middle", "ShowTitle": false } ]
+    }
+  ]
+}

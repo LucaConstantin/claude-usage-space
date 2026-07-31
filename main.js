@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session, safeStorage, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, session, safeStorage, desktopCapturer, Tray, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -11,6 +11,8 @@ const store = new Store();
 const CHROME_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 let mainWindow = null;
+let tray = null;
+let isQuitting = false;   // true only when the user really quits (keeps the deck server alive otherwise)
 
 app.on('ready', () => {
   session.defaultSession.setUserAgent(CHROME_USER_AGENT);
@@ -161,6 +163,11 @@ function createMainWindow() {
     });
   });
 
+  // Closing the window hides to tray (keeps the deck server alive) unless quitting
+  mainWindow.on('close', (e) => {
+    if (!isQuitting) { e.preventDefault(); mainWindow.hide(); }
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -168,6 +175,29 @@ function createMainWindow() {
   if (process.env.NODE_ENV === 'development') {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   }
+}
+
+function showWindow() {
+  if (!mainWindow) { createMainWindow(); return; }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function createTray() {
+  if (tray) return;
+  try {
+    tray = new Tray(path.join(__dirname, 'assets/icon.png'));
+  } catch (e) { return; }
+  const menu = Menu.buildFromTemplate([
+    { label: 'Show Claude Usage Space', click: () => showWindow() },
+    { type: 'separator' },
+    { label: 'Quit', click: () => { isQuitting = true; app.quit(); } }
+  ]);
+  tray.setToolTip('Claude Usage Space — feeding your Stream Deck');
+  tray.setContextMenu(menu);
+  tray.on('click', () => showWindow());
+  tray.on('double-click', () => showWindow());
 }
 
 // IPC: Get credentials
@@ -481,6 +511,17 @@ ipcMain.handle('is-fullscreen', () => {
   return mainWindow ? mainWindow.isFullScreen() : false;
 });
 
+// IPC: Launch at PC startup
+ipcMain.handle('get-launch-at-login', () => app.getLoginItemSettings().openAtLogin);
+ipcMain.handle('set-launch-at-login', (event, enabled) => {
+  app.setLoginItemSettings({
+    openAtLogin: !!enabled,
+    // start minimized-ish on boot; the app opens its own window
+    args: ['--startup']
+  });
+  return app.getLoginItemSettings().openAtLogin;
+});
+
 // ═══════════════════════════════════════════════
 // Music Detection - Persistent PowerShell SMTC
 // ═══════════════════════════════════════════════
@@ -654,6 +695,77 @@ ipcMain.handle('fetch-album-art', async (event, title, artist) => {
   return null;
 });
 
+// ═══════════════════════════════════════════════
+// Stream Deck local data server (127.0.0.1:37587)
+// Serves all accounts' usage so a Stream Deck plugin can render them.
+// ═══════════════════════════════════════════════
+
+const DECK_PORT = 37587;
+let deckCache = { accounts: [], ts: 0 };
+let deckRefreshing = false;
+let deckLastClient = 0;
+
+async function refreshDeckData() {
+  if (deckRefreshing) return;
+  deckRefreshing = true;
+  try {
+    const accounts = getAccounts();
+    const out = [];
+    for (const acc of accounts) {
+      try {
+        const key = getAccountKey(acc.id);
+        if (!key || !acc.organizationId) { out.push({ id: acc.id, label: acc.label, error: 'no-key' }); continue; }
+        await setCookieOn(sessionFor(acc.id), key);
+        const d = await fetchUsageBundle(partitionFor(acc.id), acc.organizationId);
+        out.push({
+          id: acc.id,
+          label: acc.label,
+          session: Math.round(d.five_hour?.utilization || 0),
+          week: Math.round(d.seven_day?.utilization || 0),
+          sessionResets: d.five_hour?.resets_at || null,
+          weekResets: d.seven_day?.resets_at || null,
+          plan: d.plan?.label || ''
+        });
+      } catch (e) {
+        out.push({ id: acc.id, label: acc.label, error: (e && e.message) || 'error' });
+      }
+    }
+    deckCache = { accounts: out, ts: Date.now() };
+  } finally {
+    deckRefreshing = false;
+  }
+}
+
+function startDeckServer() {
+  const http = require('http');
+  const server = http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-store');
+    if (req.url && req.url.startsWith('/usage')) {
+      deckLastClient = Date.now();
+      if (Date.now() - deckCache.ts > 20000) refreshDeckData(); // refresh async, serve current
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify(deckCache));
+    } else {
+      res.statusCode = 404;
+      res.end('not found');
+    }
+  });
+  server.on('error', (e) => {
+    console.log('[deck] server error: ' + e.message);
+    if (e.code === 'EADDRINUSE') {
+      // A stale instance may still hold the port — retry shortly
+      setTimeout(() => { try { server.close(); } catch (x) {} server.listen(DECK_PORT, '127.0.0.1'); }, 1500);
+    }
+  });
+  server.listen(DECK_PORT, '127.0.0.1', () => console.log('[deck] serving on 127.0.0.1:' + DECK_PORT));
+
+  // Keep the cache warm while a Stream Deck client is actively polling
+  setInterval(() => {
+    if (Date.now() - deckLastClient < 120000) refreshDeckData();
+  }, 15000);
+}
+
 // App lifecycle
 app.whenReady().then(async () => {
   let sessionKey = null;
@@ -670,12 +782,18 @@ app.whenReady().then(async () => {
   if (sessionKey) await setSessionCookie(sessionKey);
 
   startSmtcProcess();
+  startDeckServer();
   createMainWindow();
+  createTray();
 });
 
 app.on('window-all-closed', () => {
-  app.quit();
+  // Keep running in the tray so the Stream Deck server stays alive.
+  // Only quit if the user explicitly chose Quit.
+  if (isQuitting) app.quit();
 });
+
+app.on('before-quit', () => { isQuitting = true; });
 
 app.on('will-quit', () => {
   if (psProcess) {
@@ -690,9 +808,7 @@ if (!gotTheLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.focus();
-    }
+    // Launching again just re-shows the existing instance (which keeps the server up)
+    showWindow();
   });
 }
